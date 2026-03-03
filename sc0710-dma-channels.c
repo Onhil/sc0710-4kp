@@ -162,10 +162,7 @@ int sc0710_dma_channels_start(struct sc0710_dev *dev)
 			sc_read(dev, 0, 0x1064),
 			sc_read(dev, 0, 0x1070));
 
-		/* Dump full MCU register map to discover pipeline control registers */
-		mutex_lock(&dev->signalMutex);
-		sc0710_i2c_dump_mcu_regs(dev);
-		mutex_unlock(&dev->signalMutex);
+		/* MCU dump removed — probing 0x66 corrupts I2C bus and kills MCU */
 	}
 
 	return 0;

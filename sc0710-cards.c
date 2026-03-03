@@ -91,15 +91,6 @@ void sc0710_card_setup(struct sc0710_dev *dev)
 	case SC0710_BOARD_ELGATEO_4KP:
 		sc_write(dev, 0, BAR0_00C4, 0x000f0000);
 
-		/* Pre-configure FPGA pipeline at init time so the video input
-		 * detector (BAR0_A8) can detect signal before streaming starts.
-		 * Without this, A8 stays 0 even when LT6911 has locked HDMI.
-		 */
-		sc_write(dev, 0, 0xec, 0x01);
-		sc_write(dev, 0, 0x100, 0xc8);
-		sc_write(dev, 0, BAR0_00D0, 0x4100); /* Pipeline config, not yet running */
-		sc_write(dev, 0, BAR0_00DC, 0x1050); /* Pipeline control */
-
 		sc_write(dev, 1, BAR1_0094, 0x00fffe3e);
 		sc_write(dev, 1, BAR1_0008, 0x00fffe3e);
 		sc_write(dev, 1, BAR1_0194, 0x00fffe3e);
