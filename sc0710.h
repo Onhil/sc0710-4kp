@@ -254,6 +254,7 @@ struct sc0710_dma_channel
 	u32                          reg_sg_credits;
 
 	/* DMA related items we need to track. */
+	u32                          sg_total_descriptors;
 	u32                          dma_completed_descriptor_count_last;
 
 	/* Statistics */

@@ -96,9 +96,13 @@ int sc0710_dma_channels_start(struct sc0710_dev *dev)
 	} else {
 		sc_write(dev, 0, BAR0_00C8, 0x438); /* 1080 default */
 	}
-	sc_write(dev, 0, BAR0_00D8, 0x438);  /* Scaler output height (1080p) */
 	sc_write(dev, 0, BAR0_00DC, 0x1050); /* Pipeline control */
 	sc_write(dev, 0, BAR0_00D0, 0x4100);
+
+	/* Scaler output height must be written after pipeline is initialized.
+	 * On the 4K Pro, writing D8 before D0=0x4100 is silently ignored.
+	 */
+	sc_write(dev, 0, BAR0_00D8, 0x438);
 
 	/* Start all DMA channels. */
 	for (i = 0; i < SC0710_MAX_CHANNELS; i++) {
