@@ -91,6 +91,14 @@ void sc0710_card_setup(struct sc0710_dev *dev)
 	case SC0710_BOARD_ELGATEO_4KP:
 		sc_write(dev, 0, BAR0_00C4, 0x000f0000);
 
+		/* Soft reset the AXI IIC controller (IP base 0x3000).
+		 * SOFTR at offset 0x040, key value 0x0A.
+		 * Without this, the 4KP's I2C controller starts wedged —
+		 * TX FIFO never drains and bus never goes busy.
+		 */
+		sc_write(dev, 0, 0x3040, 0x0000000a);
+		udelay(10);
+
 		/* AXI IIC timing registers — match Windows driver values.
 		 * These configure I2C bus timing for AXI IIC controller #0.
 		 */

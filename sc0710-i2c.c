@@ -32,17 +32,18 @@
 #if 1 /* Enable I2C write for tone mapping control */
 static int didack(struct sc0710_dev *dev)
 {
-	u32 v;
+	u32 v = 0;
 	int cnt = 16;
 
 	while (cnt-- > 0) {
 		v = sc_read(dev, 0, BAR0_3104);
-		if ((v == 0x44) || (v == 0xc0)) {
+		if ((v == 0x44) || (v == 0xc0) || (v == 0x40)) {
 			return 1; /* device Ack'd */
 		}
 		udelay(64);
 	}
 
+	printk(KERN_DEBUG "%s: didack NACK, last 3104=%08x\n", dev->name, v);
 	return 0; /* No Ack */
 }
 #endif
@@ -61,8 +62,10 @@ static u8 busread(struct sc0710_dev *dev)
 		}
 
 		v = sc_read(dev, 0, BAR0_3104);
-//printk("readbus %08x\n", v);
-		if ((v == 0x0000008c) || (v == 0x000000ac))
+		/* Wait for RX data: RX_FIFO_Empty (bit 6) clear means data available.
+		 * mk2 sees 0x8C/0xAC; 4KP may differ in bus-busy/SRW bits.
+		 */
+		if (!(v & 0x40)) /* RX_FIFO not empty — data ready */
 			break;
 		udelay(100);
 	}
@@ -140,39 +143,43 @@ static int __sc0710_i2c_writeread(struct sc0710_dev *dev, u8 devaddr8bit, u8 *wb
 	sc_write(dev, 0, BAR0_3100, 0x00000001); /* AXI IIC Enable */
 	sc_write(dev, 0, BAR0_3108, 0x00000000 | (1 << 8) /* Start Bit */ | i2c_devaddr);
 
-	/* Wait for the device ack */
+	/* Wait for the device ack.
+	 * 4KP returns 0x40 (no bus-busy bit) instead of 0x44.
+	 * Accept both — the transaction proceeds regardless.
+	 */
 	while (cnt > 0) {
 		if (time_after(jiffies, timeout)) {
-			return 0;
+			return -ETIMEDOUT;
 		}
 		v = sc_read(dev, 0, BAR0_3104);
-		if (v == 0x00000044)
+		if ((v == 0x00000044) || (v == 0x00000040))
 			break;
 		udelay(50);
 		cnt--;
 	}
-	//dprintk(0, "Read 3104 %08x at cnt %d -- 44?\n", v, cnt);
 	if (cnt <= 0) {
-		return 0;
+		return 0; /* Continue anyway — 4KP may not set bus-busy */
 	}
 
 	/* Write out subaddress (single byte) */
 	/* Note: Hardware currently only uses single byte sub-addresses. */
 	sc_write(dev, 0, BAR0_3108, 0x00000000 | i2c_subaddr);
 
-	/* Wait for the device ack */
+	/* Wait for sub-address ACK: TX_FIFO_Empty (bit 7) means data was consumed.
+	 * mk2 sees 0xC4 (TX empty + RX empty + bus busy).
+	 * 4KP may differ if bus-busy bit behaves differently.
+	 */
 	cnt = 16;
 	while (cnt > 0) {
 		if (time_after(jiffies, timeout)) {
 			return 0;
 		}
 		v = sc_read(dev, 0, BAR0_3104);
-		if (v == 0x000000c4)
+		if (v & 0x80) /* TX_FIFO_Empty — sub-address byte consumed */
 			break;
 		udelay(50);
 		cnt--;
 	}
-	//dprintk(0, "Read 3104 %08x at cnt %d -- c4?\n", v, cnt);
 
 	msleep(1); // pkt 15162
 	sc_write(dev, 0, BAR0_3120, 0x0000000f);
@@ -194,9 +201,11 @@ static int __sc0710_i2c_writeread(struct sc0710_dev *dev, u8 devaddr8bit, u8 *wb
 		cnt++;
 	}
 	v = sc_read(dev, 0, BAR0_3104);
-	/* Accept both 0xc8 and 0xcc as valid completion status */
-	if (v != 0xc8 && v != 0xcc) {
-		printk("3104 %08x --- c8/cc?\n", sc_read(dev, 0, BAR0_3104));
+	/* Completion: TX_FIFO_Empty (bit 7) + RX_FIFO_Empty (bit 6) = all done.
+	 * mk2 sees 0xC8/0xCC; 4KP may differ in SRW/BB bits.
+	 */
+	if ((v & 0xC0) != 0xC0) {
+		printk("3104 %08x --- completion?\n", v);
 		printk("  ac %08x --- 0?\n", sc_read(dev, 0, BAR0_00AC));
 		return -1;
 	}
@@ -850,20 +859,40 @@ static int lt6911_read_reg(struct sc0710_dev *dev, u8 bank, u8 reg, u8 *val)
 	return 0;
 }
 
-/* Check pipeline status before DMA start.
+/* Send init commands to MCU/LT6911 and check pipeline status before DMA start.
+ * These are the original cfg_unknownpart/cfg_unknownpart2 commands from the
+ * upstream mk2 driver (were #if 0'd out). Note: sc0710_i2c_write() skips
+ * wbuf[0], so wbuf[0] is a dummy byte.
+ *
  * Caller must hold signalMutex.
  */
 int sc0710_lt6911_enable_output(struct sc0710_dev *dev)
 {
-	u32 a8, ac, d8, e4;
+	u32 a8;
+	int ret;
+
+	/* cfg_unknownpart2: write 0x01 to MCU (0x64).
+	 * wbuf[0]=dummy, wbuf[1]=0x01 sent on wire.
+	 */
+	u8 mcu_cmd[2] = { 0x10, 0x01 };
+	ret = sc0710_i2c_write(dev, I2C_DEV__ARM_MCU, mcu_cmd, sizeof(mcu_cmd));
+	if (ret < 0)
+		printk(KERN_WARNING "%s: MCU init cmd failed: %d\n", dev->name, ret);
+
+	msleep(50);
+
+	/* cfg_unknownpart: write {0x03, 0x12, 0x34, 0x57} to LT6911 proxy (0x66).
+	 * wbuf[0]=dummy, wbuf[1..4] sent on wire as sub=0x03 data=0x12,0x34,0x57.
+	 */
+	u8 lt_cmd[5] = { 0xAB, 0x03, 0x12, 0x34, 0x57 };
+	ret = sc0710_i2c_write(dev, I2C_DEV__UNKNOWN, lt_cmd, sizeof(lt_cmd));
+	if (ret < 0)
+		printk(KERN_WARNING "%s: LT6911 init cmd failed: %d\n", dev->name, ret);
+
+	msleep(200);
 
 	a8 = sc_read(dev, 0, 0xa8);
-	ac = sc_read(dev, 0, 0xac);
-	d8 = sc_read(dev, 0, BAR0_00D8);
-	e4 = sc_read(dev, 0, 0xe4);
-
-	printk(KERN_INFO "%s: Pipeline before DMA: A8=%08x AC=%08x D8=%08x E4=%08x\n",
-		dev->name, a8, ac, d8, e4);
+	printk(KERN_INFO "%s: Pipeline after init cmds: A8=%08x\n", dev->name, a8);
 
 	return 0;
 }
@@ -884,6 +913,42 @@ int sc0710_i2c_initialize(struct sc0710_dev *dev)
 	printk(KERN_INFO "%s: MCU register map (0x64, sub 0x00-0xFF):\n", dev->name);
 
 	mutex_lock(&dev->signalMutex);
+
+	/* Diagnostic: check I2C controller state after card_setup() soft reset + timing config */
+	{
+		u32 sr = sc_read(dev, 0, BAR0_3104);
+		u32 cr = sc_read(dev, 0, BAR0_3100);
+		printk(KERN_INFO "%s: I2C controller after card_setup: CR=%08x SR=%08x\n",
+			dev->name, cr, sr);
+	}
+
+	/* Wait for MCU to be ready after PCI enumeration */
+	msleep(500);
+
+	/* Send original upstream init commands (were #if 0'd out in mk2 code).
+	 * sc0710_i2c_write() skips wbuf[0], so wbuf[0] is a dummy byte.
+	 *
+	 * cfg_unknownpart2: Write 0x01 to MCU (0x64). On wire: [0x64+W][0x01]
+	 * cfg_unknownpart: Write {0x03, 0x12, 0x34, 0x57} to LT6911 proxy (0x66).
+	 */
+	{
+		u8 mcu_cmd[2] = { 0x10, 0x01 };
+		u8 lt_cmd[5] = { 0xAB, 0x03, 0x12, 0x34, 0x57 };
+
+		ret = sc0710_i2c_write(dev, I2C_DEV__ARM_MCU, mcu_cmd, sizeof(mcu_cmd));
+		printk(KERN_INFO "%s: MCU init write: ret=%d\n", dev->name, ret);
+
+		msleep(50);
+
+		ret = sc0710_i2c_write(dev, I2C_DEV__UNKNOWN, lt_cmd, sizeof(lt_cmd));
+		printk(KERN_INFO "%s: LT6911 init write: ret=%d\n", dev->name, ret);
+
+		msleep(200);
+
+		printk(KERN_INFO "%s: Init cmds sent, A8=%08x\n",
+			dev->name, sc_read(dev, 0, 0xa8));
+	}
+
 	for (subaddr = 0x00; ; subaddr += 0x10) {
 		wbuf[0] = subaddr;
 		memset(rbuf, 0, sizeof(rbuf));
