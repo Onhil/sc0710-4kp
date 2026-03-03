@@ -552,6 +552,36 @@ const struct sc0710_format *sc0710_format_find_by_timing_and_rate(u32 timingH, u
 		}
 	}
 
+	if (best_fmt)
+		return best_fmt;
+
+	/* Fallback: match on active width/height instead of total timing.
+	 * The 4K Pro MCU reports active resolution in the timing fields,
+	 * unlike the MK2 which reports total timing with blanking.
+	 */
+	for (i = 0; i < ARRAY_SIZE(formats); i++) {
+		if ((formats[i].width == timingH) && (formats[i].height == timingV)) {
+			u32 fps = formats[i].fpsX100 / 100;
+			u32 diff;
+
+			if (target_fps == 0)
+				return &formats[i];
+
+			if (fps > target_fps)
+				diff = fps - target_fps;
+			else
+				diff = target_fps - fps;
+
+			if (diff < best_diff) {
+				best_diff = diff;
+				best_fmt = &formats[i];
+			}
+
+			if (diff == 0)
+				return &formats[i];
+		}
+	}
+
 	return best_fmt;
 }
 
