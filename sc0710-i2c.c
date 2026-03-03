@@ -371,12 +371,27 @@ int sc0710_i2c_read_hdmi_status(struct sc0710_dev *dev)
 	 * MK2: rbuf[8] is a dedicated lock flag (0 or 1).
 	 * 4K Pro: rbuf[8] is part of the active resolution data, not a lock flag.
 	 *         Use presence of timing data in [4:7] as the lock indicator instead.
+	 *         The 4K Pro MCU intermittently returns all-zero responses even with
+	 *         a valid signal, so require multiple consecutive dropouts before
+	 *         declaring signal loss.
 	 */
 	int signal_locked;
-	if (dev->board == SC0710_BOARD_ELGATEO_4KP)
-		signal_locked = (rbuf[4] | rbuf[5] | rbuf[6] | rbuf[7]) != 0;
-	else
+	if (dev->board == SC0710_BOARD_ELGATEO_4KP) {
+		int raw_locked = (rbuf[4] | rbuf[5] | rbuf[6] | rbuf[7]) != 0;
+		if (raw_locked) {
+			dev->lock_dropout_count = 0;
+			signal_locked = 1;
+		} else if (was_locked && dev->lock_dropout_count < 5) {
+			/* Hold locked state through transient dropouts (~1s at 200ms poll) */
+			dev->lock_dropout_count++;
+			mutex_unlock(&dev->signalMutex);
+			return 0;
+		} else {
+			signal_locked = 0;
+		}
+	} else {
 		signal_locked = rbuf[8] != 0;
+	}
 
 	if (signal_locked) {
 		u32 new_pixelLineH, new_pixelLineV;

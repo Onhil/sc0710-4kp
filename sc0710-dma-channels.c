@@ -29,6 +29,7 @@ int sc0710_dma_channels_resize(struct sc0710_dev *dev)
 	printk(KERN_ERR "%s()\n", __func__);
 	switch (dev->board) {
 	case SC0710_BOARD_ELGATEO_4KP60_MK2:
+	case SC0710_BOARD_ELGATEO_4KP:
 		sc0710_dma_channel_resize(dev, 0, CHDIR_INPUT, 0x1000, CHTYPE_VIDEO);
 		/* Audio uses fixed buffer size, do not resize as it may be active via ALSA */
 		/* sc0710_dma_channel_resize(dev, 1, CHDIR_INPUT, 0x1100, CHTYPE_AUDIO); */
@@ -42,6 +43,7 @@ int sc0710_dma_channels_alloc(struct sc0710_dev *dev)
 {
 	switch (dev->board) {
 	case SC0710_BOARD_ELGATEO_4KP60_MK2:
+	case SC0710_BOARD_ELGATEO_4KP:
 		sc0710_dma_channel_alloc(dev, 0, CHDIR_INPUT, 0x1000, CHTYPE_VIDEO);
 		sc0710_dma_channel_alloc(dev, 1, CHDIR_INPUT, 0x1100, CHTYPE_AUDIO);
 		break;
@@ -94,10 +96,8 @@ int sc0710_dma_channels_start(struct sc0710_dev *dev)
 	} else {
 		sc_write(dev, 0, BAR0_00C8, 0x438); /* 1080 default */
 	}
-	sc_write(dev, 0, BAR0_00D0, 0x4100);
-	sc_write(dev, 0, 0xcc, 0);
-	sc_write(dev, 0, 0xdc, 0);
-	sc_write(dev, 0, BAR0_00D0, 0x4300);
+	sc_write(dev, 0, BAR0_00D8, 0x438);  /* Scaler output height (1080p) */
+	sc_write(dev, 0, BAR0_00DC, 0x1050); /* Pipeline control */
 	sc_write(dev, 0, BAR0_00D0, 0x4100);
 
 	/* Start all DMA channels. */

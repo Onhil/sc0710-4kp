@@ -384,6 +384,7 @@ struct sc0710_dev {
 	enum sc0710_eotf_e         eotf;       /* Detected/forced EOTF for HDR */
 	u32                        cable_connected; /* 5V sense: cable physically present */
 	u32                        unlocked_no_timing_count; /* Consecutive polls with no lock and no timing */
+	u32                        lock_dropout_count;       /* Consecutive polls with no lock while previously locked */
 
 
 
