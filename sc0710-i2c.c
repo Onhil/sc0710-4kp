@@ -850,27 +850,245 @@ static int lt6911_read_reg(struct sc0710_dev *dev, u8 bank, u8 reg, u8 *val)
 	return 0;
 }
 
-/* Check pipeline status before DMA start.
- * Pipeline registers (EC, 0x100, D0, DC) are now set early in card_setup(),
- * giving the FPGA time to detect video input before streaming begins.
+/* I2C bus scan + direct MCU 0xAB command + MCU sub-address sweep.
+ *
+ * Explore I2C address 0xC0 register map (returned 04 11 33 43 — 0x33 = LT6911 addr).
+ * Comprehensive address scan to find all unique MCU register views.
+ * Try writes to 0xC0 address and 0x66 sub-address sweep.
+ *
+ * Caller must hold signalMutex.
  */
 int sc0710_lt6911_enable_output(struct sc0710_dev *dev)
 {
-	u32 a8, ac, d8, e4;
+	u32 a8;
+	int ret;
+	u8 wbuf[8];
+	u8 rbuf[0x10];
 
 	a8 = sc_read(dev, 0, 0xa8);
-	ac = sc_read(dev, 0, 0xac);
-	d8 = sc_read(dev, 0, BAR0_00D8);
-	e4 = sc_read(dev, 0, 0xe4);
+	printk(KERN_INFO "%s: deep-probe: A8=%08x\n", dev->name, a8);
+	if (a8 != 0)
+		return 0;
 
-	printk(KERN_INFO "%s: Pipeline before DMA: A8=%08x AC=%08x D8=%08x E4=%08x\n",
-		dev->name, a8, ac, d8, e4);
+	/* === PHASE 1: Full register dump from I2C address 0xC0 ===
+	 * This address returned unique data: 04 11 33 43
+	 * Read sub-addresses 0x00-0xF0 to map the entire register space.
+	 */
+	printk(KERN_INFO "%s: P1: addr 0xC0 register map\n", dev->name);
+	{
+		u8 sub;
+		for (sub = 0x00; ; sub += 0x10) {
+			int any_nonzero = 0, j;
+			wbuf[0] = sub;
+			memset(rbuf, 0, sizeof(rbuf));
+			ret = __sc0710_i2c_writeread(dev, 0xC0, wbuf, 1, rbuf, 0x10);
+			if (ret < 0) {
+				if (sub >= 0xF0) break;
+				continue;
+			}
+			for (j = 0; j < 0x10; j++) {
+				if (rbuf[j] != 0x00 && rbuf[j] != 0xFF)
+					any_nonzero = 1;
+			}
+			if (any_nonzero || sub == 0x00) {
+				printk(KERN_INFO "%s: 0xC0 sub=0x%02x: %02x %02x %02x %02x  %02x %02x %02x %02x  %02x %02x %02x %02x  %02x %02x %02x %02x\n",
+					dev->name, sub,
+					rbuf[0], rbuf[1], rbuf[2], rbuf[3],
+					rbuf[4], rbuf[5], rbuf[6], rbuf[7],
+					rbuf[8], rbuf[9], rbuf[10], rbuf[11],
+					rbuf[12], rbuf[13], rbuf[14], rbuf[15]);
+			}
+			if (sub >= 0xF0) break;
+		}
+	}
+
+	/* === PHASE 2: Comprehensive even-address scan ===
+	 * Read 4 bytes from sub=0x00 of EVERY even address 0x00-0xFE.
+	 * Only print when data changes from previous address.
+	 */
+	printk(KERN_INFO "%s: P2: Full address scan\n", dev->name);
+	{
+		u8 addr;
+		u8 prev[4] = {0xFF, 0xFF, 0xFF, 0xFF};
+		int first = 1;
+
+		for (addr = 0x00; ; addr += 0x02) {
+			wbuf[0] = 0x00;
+			memset(rbuf, 0xFF, 4);
+			ret = __sc0710_i2c_writeread(dev, addr, wbuf, 1, rbuf, 4);
+			if (ret == 0) {
+				if (first || memcmp(rbuf, prev, 4) != 0) {
+					printk(KERN_INFO "%s: scan 0x%02x: %02x %02x %02x %02x%s\n",
+						dev->name, addr,
+						rbuf[0], rbuf[1], rbuf[2], rbuf[3],
+						first ? "" : " (changed)");
+					first = 0;
+				}
+				memcpy(prev, rbuf, 4);
+			}
+			if (addr >= 0xFE) break;
+		}
+	}
+
+	/* === PHASE 3: Write to I2C address 0xC0 ===
+	 * The 0xC0 register map might be a control interface.
+	 * Try writing specific values to sub=0x00.
+	 */
+	printk(KERN_INFO "%s: P3: Writing to addr 0xC0\n", dev->name);
+	{
+		/* T1: Write sub=0x00 val=0x01 */
+		wbuf[0] = 0;
+		wbuf[1] = 0x00;
+		wbuf[2] = 0x01;
+		ret = sc0710_i2c_write(dev, 0xC0, wbuf, 3);
+		msleep(200);
+		a8 = sc_read(dev, 0, 0xa8);
+		printk(KERN_INFO "%s: T1 0xC0 sub=0x00 val=0x01 A8=%08x\n", dev->name, a8);
+
+		/* T2: Write sub=0x00 val=0x05 (if 0x04 is current state, try 0x05) */
+		wbuf[0] = 0;
+		wbuf[1] = 0x00;
+		wbuf[2] = 0x05;
+		ret = sc0710_i2c_write(dev, 0xC0, wbuf, 3);
+		msleep(200);
+		a8 = sc_read(dev, 0, 0xa8);
+		printk(KERN_INFO "%s: T2 0xC0 sub=0x00 val=0x05 A8=%08x\n", dev->name, a8);
+
+		/* T3: Write 0xAB command to 0xC0 */
+		wbuf[0] = 0;
+		wbuf[1] = 0xAB;
+		wbuf[2] = 0x03;
+		wbuf[3] = 0x12;
+		wbuf[4] = 0x34;
+		wbuf[5] = 0x57;
+		ret = sc0710_i2c_write(dev, 0xC0, wbuf, 6);
+		msleep(200);
+		a8 = sc_read(dev, 0, 0xa8);
+		printk(KERN_INFO "%s: T3 0xC0+0xAB cmd A8=%08x\n", dev->name, a8);
+
+		/* Restore 0xC0 sub=0x00 to original */
+		wbuf[0] = 0;
+		wbuf[1] = 0x00;
+		wbuf[2] = 0x04;
+		ret = sc0710_i2c_write(dev, 0xC0, wbuf, 3);
+	}
+
+	/* === PHASE 4: 0x66 sub-address sweep (read-only first) ===
+	 * Read 4 bytes from each sub-address on 0x66.
+	 */
+	printk(KERN_INFO "%s: P4: 0x66 sub-addr read sweep\n", dev->name);
+	{
+		u8 sub;
+		for (sub = 0x00; ; sub += 0x10) {
+			int any_nonzero = 0, j;
+			wbuf[0] = sub;
+			memset(rbuf, 0, 8);
+			ret = __sc0710_i2c_writeread(dev, I2C_DEV__UNKNOWN, wbuf, 1, rbuf, 8);
+			if (ret < 0) {
+				if (sub >= 0xF0) break;
+				continue;
+			}
+			for (j = 0; j < 8; j++) {
+				if (rbuf[j] != 0x00 && rbuf[j] != 0xFF &&
+				    rbuf[j] != 0x16 && rbuf[j] != 0x02 && rbuf[j] != 0x0B)
+					any_nonzero = 1;
+			}
+			if (any_nonzero || sub == 0x00) {
+				printk(KERN_INFO "%s: 0x66 sub=0x%02x: %02x %02x %02x %02x  %02x %02x %02x %02x\n",
+					dev->name, sub,
+					rbuf[0], rbuf[1], rbuf[2], rbuf[3],
+					rbuf[4], rbuf[5], rbuf[6], rbuf[7]);
+			}
+			if (sub >= 0xF0) break;
+		}
+	}
+
+	/* === PHASE 5: Write to 0x66 sub-address sweep ===
+	 * Try writing value 0x01 to key 0x66 sub-addresses.
+	 */
+	printk(KERN_INFO "%s: P5: 0x66 sub-addr write sweep\n", dev->name);
+	{
+		static const u8 subs[] = {
+			0x02, 0x04, 0x05, 0x06, 0x08, 0x0A, 0x0C, 0x0E,
+			0x11, 0x12, 0x14, 0x16, 0x18, 0x1A, 0x1C, 0x1E,
+			0x21, 0x22, 0x24, 0x28, 0x2A, 0x2C, 0x2E,
+			0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90,
+			0xA0, 0xB0, 0xC0, 0xD0, 0xE0, 0xF0, 0xFE,
+		};
+		int i;
+		for (i = 0; i < (int)ARRAY_SIZE(subs); i++) {
+			wbuf[0] = 0;
+			wbuf[1] = subs[i];
+			wbuf[2] = 0x01;
+			ret = sc0710_i2c_write(dev, I2C_DEV__UNKNOWN, wbuf, 3);
+			msleep(50);
+			a8 = sc_read(dev, 0, 0xa8);
+			if (a8 != 0) {
+				printk(KERN_INFO "%s: *** A8 CHANGED! 0x66 sub=0x%02x A8=%08x ***\n",
+					dev->name, subs[i], a8);
+				return 0;
+			}
+		}
+		printk(KERN_INFO "%s: P5: all 0x66 sub-writes A8=0\n", dev->name);
+	}
+
+	a8 = sc_read(dev, 0, 0xa8);
+	printk(KERN_INFO "%s: Final A8=%08x\n", dev->name, a8);
 
 	return 0;
 }
 
 int sc0710_i2c_initialize(struct sc0710_dev *dev)
 {
+	u8 subaddr;
+	u8 wbuf[1];
+	u8 rbuf[0x10];
+	int ret, i, any_nonzero;
+
+	if (dev->board != SC0710_BOARD_ELGATEO_4KP)
+		return 0;
+
+	/* Safe MCU-only register dump at init time.
+	 * DO NOT probe 0x66 (LT6911) — that corrupts the I2C bus.
+	 */
+	printk(KERN_INFO "%s: MCU register map (0x64, sub 0x00-0xFF):\n", dev->name);
+
+	mutex_lock(&dev->signalMutex);
+	for (subaddr = 0x00; ; subaddr += 0x10) {
+		wbuf[0] = subaddr;
+		memset(rbuf, 0, sizeof(rbuf));
+
+		ret = __sc0710_i2c_writeread(dev, I2C_DEV__ARM_MCU,
+			wbuf, sizeof(wbuf), rbuf, sizeof(rbuf));
+		if (ret < 0) {
+			printk(KERN_INFO "%s:   sub=0x%02x: ERROR %d\n",
+				dev->name, subaddr, ret);
+			if (subaddr >= 0xF0)
+				break;
+			continue;
+		}
+
+		any_nonzero = 0;
+		for (i = 0; i < 0x10; i++) {
+			if (rbuf[i]) {
+				any_nonzero = 1;
+				break;
+			}
+		}
+		if (any_nonzero || subaddr == 0x00) {
+			printk(KERN_INFO "%s:   sub=0x%02x: %02x %02x %02x %02x  %02x %02x %02x %02x  %02x %02x %02x %02x  %02x %02x %02x %02x\n",
+				dev->name, subaddr,
+				rbuf[0], rbuf[1], rbuf[2], rbuf[3],
+				rbuf[4], rbuf[5], rbuf[6], rbuf[7],
+				rbuf[8], rbuf[9], rbuf[10], rbuf[11],
+				rbuf[12], rbuf[13], rbuf[14], rbuf[15]);
+		}
+
+		if (subaddr >= 0xF0)
+			break;
+	}
+	mutex_unlock(&dev->signalMutex);
+
 	return 0;
 }
 

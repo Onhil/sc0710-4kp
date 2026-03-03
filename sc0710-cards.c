@@ -91,6 +91,18 @@ void sc0710_card_setup(struct sc0710_dev *dev)
 	case SC0710_BOARD_ELGATEO_4KP:
 		sc_write(dev, 0, BAR0_00C4, 0x000f0000);
 
+		/* AXI IIC timing registers — match Windows driver values.
+		 * These configure I2C bus timing for AXI IIC controller #0.
+		 */
+		sc_write(dev, 0, 0x3128, 0x0000002d); /* TSUSTA */
+		sc_write(dev, 0, 0x312c, 0x0000002d); /* TSUSTO */
+		sc_write(dev, 0, 0x3130, 0x0000002d); /* THDSTA */
+		sc_write(dev, 0, 0x3134, 0x00000014); /* TSUDAT */
+		sc_write(dev, 0, 0x3138, 0x00000050); /* TBUF */
+		sc_write(dev, 0, 0x313c, 0x00000076); /* THIGH */
+		sc_write(dev, 0, 0x3140, 0x00000076); /* TLOW */
+		sc_write(dev, 0, 0x3144, 0x00000001); /* THDDAT */
+
 		sc_write(dev, 1, BAR1_0094, 0x00fffe3e);
 		sc_write(dev, 1, BAR1_0008, 0x00fffe3e);
 		sc_write(dev, 1, BAR1_0194, 0x00fffe3e);
