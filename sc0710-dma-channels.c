@@ -67,6 +67,7 @@ void sc0710_dma_channels_stop(struct sc0710_dev *dev)
 
 	printk("%s()\n", __func__);
 
+	sc_write(dev, 0, BAR0_00E4, 0x0000);
 	sc_clr(dev, 0, BAR0_00D0, 0x0001);
 
 	for (i = 0; i < SC0710_MAX_CHANNELS; i++) {
@@ -85,11 +86,6 @@ int sc0710_dma_channels_start(struct sc0710_dev *dev)
 		ret = sc0710_dma_channel_start_prep(&dev->channel[i]);
 	}
 
-	/* TODO: What do these registers do? Any documentation? */
-	/* Digging into the reference drivers for the SCxxxx cards available
-	 * from the CM's website, the hardware supports a video scaler.
-	 * I'm guessing that this is setting - maybe - a scaler? */
-
 	/* Set the height register to the incoming signal format height */
 	if (dev->fmt) {
 		sc_write(dev, 0, BAR0_00C8, dev->fmt->height);
@@ -98,6 +94,14 @@ int sc0710_dma_channels_start(struct sc0710_dev *dev)
 	}
 	sc_write(dev, 0, BAR0_00D8, 0x438);  /* Scaler output height (1080p) */
 	sc_write(dev, 0, BAR0_00DC, 0x1050); /* Pipeline control */
+
+	/* Enable FPGA streaming pipeline BEFORE starting DMA.
+	 * The FPGA may need to be armed before the DMA engine starts
+	 * fetching descriptors, so data is ready when the engine runs.
+	 */
+	sc_write(dev, 0, 0x100, 0xc8);
+	sc_write(dev, 0, 0xec, 0x01);
+
 	sc_write(dev, 0, BAR0_00D0, 0x4100);
 
 	/* Start all DMA channels. */
@@ -107,13 +111,52 @@ int sc0710_dma_channels_start(struct sc0710_dev *dev)
 
 	sc_set(dev, 0, BAR0_00D0, 0x0001);
 
-	/* Enable FPGA streaming pipeline.
-	 * 0xEC=1 triggers the FPGA to start pushing data to the XDMA engine.
-	 * 0x100=0xC8 purpose unknown but present during Windows streaming.
-	 * Without 0xEC, the pipeline stays idle (D8/E4/A8 all read 0).
+	/* Enable streaming - this register appears as 1 during active streaming
+	 * in the Windows register dump and 0 when idle. Writing 1 may be
+	 * required to tell the FPGA to start producing AXI stream data.
 	 */
-	sc_write(dev, 0, 0x100, 0xc8);
-	sc_write(dev, 0, 0xec, 0x01);
+	sc_write(dev, 0, BAR0_00E4, 0x0001);
+
+	/* Debug: verify register state after start */
+	if (sc0710_debug_mode) {
+		u32 c8, d0, d8, dc, e4, ec, r100;
+		usleep_range(1000, 2000);
+		c8   = sc_read(dev, 0, BAR0_00C8);
+		d0   = sc_read(dev, 0, BAR0_00D0);
+		d8   = sc_read(dev, 0, BAR0_00D8);
+		dc   = sc_read(dev, 0, BAR0_00DC);
+		e4   = sc_read(dev, 0, 0xe4);
+		ec   = sc_read(dev, 0, 0xec);
+		r100 = sc_read(dev, 0, 0x100);
+		printk(KERN_INFO "%s: POST-START C8=%08x D0=%08x D8=%08x DC=%08x E4=%08x EC=%08x 0x100=%08x\n",
+			dev->name, c8, d0, d8, dc, e4, ec, r100);
+
+		for (i = 0; i < SC0710_MAX_CHANNELS; i++) {
+			struct sc0710_dma_channel *ch = &dev->channel[i];
+			if (!ch->enabled)
+				continue;
+			printk(KERN_INFO "%s: ch#%d ctrl=%08x s1=%08x s2=%08x desc=%08x sgcred=%08x sg_l=%08x\n",
+				ch->dev->name, ch->nr,
+				sc_read(dev, 1, ch->reg_dma_control),
+				sc_read(dev, 1, ch->reg_dma_status1),
+				sc_read(dev, 1, ch->reg_dma_status2),
+				sc_read(dev, 1, ch->reg_dma_completed_descriptor_count),
+				sc_read(dev, 1, ch->reg_sg_credits),
+				sc_read(dev, 1, ch->reg_sg_start_l));
+		}
+
+		/* Check if FPGA scaler coefficient table is loaded (BAR0 0x1060+) */
+		printk(KERN_INFO "%s: BAR0 scaler check: 0x1060=%08x 0x1064=%08x 0x1070=%08x\n",
+			dev->name,
+			sc_read(dev, 0, 0x1060),
+			sc_read(dev, 0, 0x1064),
+			sc_read(dev, 0, 0x1070));
+
+		/* Dump full MCU register map to discover pipeline control registers */
+		mutex_lock(&dev->signalMutex);
+		sc0710_i2c_dump_mcu_regs(dev);
+		mutex_unlock(&dev->signalMutex);
+	}
 
 	return 0;
 }

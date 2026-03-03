@@ -321,22 +321,9 @@ static void sc0710_reset_dma_frame_sync(struct sc0710_dev *dev)
 	/* Phase 2: Resize DMA buffers if needed (for resolution changes) */
 	sc0710_dma_channels_resize(dev);
 
-	/* Phase 3: Program hardware registers */
-	if (dev->fmt) {
-		sc_write(dev, 0, BAR0_00C8, dev->fmt->height);
-		printk(KERN_INFO "%s: Reprogrammed height register to %d\n",
-			dev->name, dev->fmt->height);
-	}
-	sc_write(dev, 0, BAR0_00D0, 0x4100);
-	sc_write(dev, 0, 0xcc, 0);
-	sc_write(dev, 0, 0xdc, 0);
-	sc_write(dev, 0, BAR0_00D0, 0x4300);
-	sc_write(dev, 0, BAR0_00D0, 0x4100);
-
-	/* Small delay before restart */
-	msleep(10);
-
-	/* Phase 4: Start DMA */
+	/* Phase 3: Start DMA - dma_channels_start() handles all register
+	 * programming (BAR0_00C8, D8, DC, D0, 0xEC, 0x100).
+	 */
 	sc0710_dma_channels_start(dev);
 	printk(KERN_INFO "%s: DMA started after signal restoration\n", dev->name);
 }
@@ -714,6 +701,96 @@ int sc0710_i2c_read_procamp(struct sc0710_dev *dev)
 }
 
 
+
+/* Dump a range of MCU I2C subaddresses for reverse engineering.
+ * Reads 16 bytes from each subaddress in steps of 0x10.
+ */
+int sc0710_i2c_dump_mcu_regs(struct sc0710_dev *dev)
+{
+	u8 subaddr;
+	u8 wbuf[1];
+	u8 rbuf[0x10];
+	int ret, i, any_nonzero;
+
+	printk(KERN_INFO "%s: MCU register dump (subaddr 0x00-0xFF):\n", dev->name);
+
+	for (subaddr = 0x00; ; subaddr += 0x10) {
+		wbuf[0] = subaddr;
+		memset(rbuf, 0, sizeof(rbuf));
+
+		ret = __sc0710_i2c_writeread(dev, I2C_DEV__ARM_MCU,
+			wbuf, sizeof(wbuf), rbuf, sizeof(rbuf));
+		if (ret < 0) {
+			printk(KERN_INFO "%s:   MCU sub=0x%02x: read error %d\n",
+				dev->name, subaddr, ret);
+			if (subaddr >= 0xF0)
+				break;
+			continue;
+		}
+
+		/* Only print if any byte is non-zero */
+		any_nonzero = 0;
+		for (i = 0; i < 0x10; i++) {
+			if (rbuf[i]) {
+				any_nonzero = 1;
+				break;
+			}
+		}
+		if (any_nonzero) {
+			printk(KERN_INFO "%s:   MCU sub=0x%02x: %02x %02x %02x %02x  %02x %02x %02x %02x  %02x %02x %02x %02x  %02x %02x %02x %02x\n",
+				dev->name, subaddr,
+				rbuf[0], rbuf[1], rbuf[2], rbuf[3],
+				rbuf[4], rbuf[5], rbuf[6], rbuf[7],
+				rbuf[8], rbuf[9], rbuf[10], rbuf[11],
+				rbuf[12], rbuf[13], rbuf[14], rbuf[15]);
+		}
+
+		if (subaddr >= 0xF0)
+			break;
+	}
+
+	/* Also probe the unknown I2C device at 0x33 */
+	printk(KERN_INFO "%s: Probing I2C device 0x66 (0x33):\n", dev->name);
+	for (subaddr = 0x00; ; subaddr += 0x10) {
+		wbuf[0] = subaddr;
+		memset(rbuf, 0, sizeof(rbuf));
+
+		ret = __sc0710_i2c_writeread(dev, I2C_DEV__UNKNOWN,
+			wbuf, sizeof(wbuf), rbuf, sizeof(rbuf));
+		if (ret < 0) {
+			if (subaddr == 0x00)
+				printk(KERN_INFO "%s:   0x66 sub=0x%02x: no ACK (device not present?)\n",
+					dev->name, subaddr);
+			if (subaddr >= 0xF0)
+				break;
+			/* If first address fails, device likely not present - skip rest */
+			if (subaddr == 0x00)
+				break;
+			continue;
+		}
+
+		any_nonzero = 0;
+		for (i = 0; i < 0x10; i++) {
+			if (rbuf[i]) {
+				any_nonzero = 1;
+				break;
+			}
+		}
+		if (any_nonzero || subaddr == 0x00) {
+			printk(KERN_INFO "%s:   0x66 sub=0x%02x: %02x %02x %02x %02x  %02x %02x %02x %02x  %02x %02x %02x %02x  %02x %02x %02x %02x\n",
+				dev->name, subaddr,
+				rbuf[0], rbuf[1], rbuf[2], rbuf[3],
+				rbuf[4], rbuf[5], rbuf[6], rbuf[7],
+				rbuf[8], rbuf[9], rbuf[10], rbuf[11],
+				rbuf[12], rbuf[13], rbuf[14], rbuf[15]);
+		}
+
+		if (subaddr >= 0xF0)
+			break;
+	}
+
+	return 0;
+}
 
 int sc0710_i2c_initialize(struct sc0710_dev *dev)
 {
