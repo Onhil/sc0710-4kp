@@ -80,9 +80,7 @@ int sc0710_dma_channels_start(struct sc0710_dev *dev)
 
 	printk("%s()\n", __func__);
 
-	/* Enable LT6911 HDMI receiver output before starting FPGA pipeline.
-	 * The FPGA needs video data from the receiver to activate its pipeline.
-	 */
+	/* Send MCU init commands for 4KP to activate FPGA pipeline */
 	if (dev->board == SC0710_BOARD_ELGATEO_4KP) {
 		mutex_lock(&dev->signalMutex);
 		sc0710_lt6911_enable_output(dev);
@@ -100,6 +98,13 @@ int sc0710_dma_channels_start(struct sc0710_dev *dev)
 	} else {
 		sc_write(dev, 0, BAR0_00C8, 0x438); /* 1080 default */
 	}
+
+	/* Pipeline input configuration - required for FPGA to process video.
+	 * Value 0x000f0000 observed in Windows BAR dump during active capture.
+	 * Must be set before D8 (scaler output height) becomes writable.
+	 */
+	sc_write(dev, 0, 0xc4, 0x000f0000);
+
 	sc_write(dev, 0, BAR0_00D8, 0x438);  /* Scaler output height (1080p) */
 	sc_write(dev, 0, BAR0_00DC, 0x1050); /* Pipeline control */
 
@@ -121,17 +126,20 @@ int sc0710_dma_channels_start(struct sc0710_dev *dev)
 
 	/* Debug: verify register state after start */
 	if (sc0710_debug_mode) {
-		u32 c8, d0, d8, dc, e4, ec, r100;
+		u32 a8, c4, c8, d0, d4, d8, dc, e4, ec, r100;
 		usleep_range(1000, 2000);
+		a8   = sc_read(dev, 0, 0xa8);
+		c4   = sc_read(dev, 0, 0xc4);
 		c8   = sc_read(dev, 0, BAR0_00C8);
 		d0   = sc_read(dev, 0, BAR0_00D0);
+		d4   = sc_read(dev, 0, 0xd4);
 		d8   = sc_read(dev, 0, BAR0_00D8);
 		dc   = sc_read(dev, 0, BAR0_00DC);
 		e4   = sc_read(dev, 0, 0xe4);
 		ec   = sc_read(dev, 0, 0xec);
 		r100 = sc_read(dev, 0, 0x100);
-		printk(KERN_INFO "%s: POST-START C8=%08x D0=%08x D8=%08x DC=%08x E4=%08x EC=%08x 0x100=%08x\n",
-			dev->name, c8, d0, d8, dc, e4, ec, r100);
+		printk(KERN_INFO "%s: POST-START A8=%08x C4=%08x C8=%08x D0=%08x D4=%08x D8=%08x DC=%08x E4=%08x EC=%08x 0x100=%08x\n",
+			dev->name, a8, c4, c8, d0, d4, d8, dc, e4, ec, r100);
 
 		for (i = 0; i < SC0710_MAX_CHANNELS; i++) {
 			struct sc0710_dma_channel *ch = &dev->channel[i];

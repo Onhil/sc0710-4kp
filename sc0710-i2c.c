@@ -850,95 +850,27 @@ static int lt6911_read_reg(struct sc0710_dev *dev, u8 bank, u8 reg, u8 *val)
 	return 0;
 }
 
-/* Send original MCU/device initialization commands from git history.
- * sc0710_i2c_write() skips wbuf[0], so we put a dummy byte there and
- * shift the actual data to wbuf[1..].
- *
- * From git history (commit 168d332):
- * - cfg_unknownpart:  wrote {0xAB, 0x03, 0x12, 0x34, 0x57} to device 0x66
- *   Intended: [START][0x66][0xAB][0x03][0x12][0x34][0x57][STOP]
- * - cfg_unknownpart2: wrote {0x10, 0x01} to MCU 0x64
- *   Intended: [START][0x64][0x10][0x01][STOP] (write 0x01 to MCU sub 0x10)
- *
- * Both were broken due to the wbuf[0] skip bug in sc0710_i2c_write.
- * This function sends them correctly.
+/* Check pipeline status before DMA start.
+ * Pipeline registers (EC, 0x100, D0, DC) are now set early in card_setup(),
+ * giving the FPGA time to detect video input before streaming begins.
  */
 int sc0710_lt6911_enable_output(struct sc0710_dev *dev)
 {
-	u8 wbuf[8];
-	u32 a8;
-	int ret;
-
-	printk(KERN_INFO "%s: Sending MCU/LT6911 init commands\n", dev->name);
+	u32 a8, ac, d8, e4;
 
 	a8 = sc_read(dev, 0, 0xa8);
-	printk(KERN_INFO "%s: BAR0_A8 before: 0x%08x\n", dev->name, a8);
+	ac = sc_read(dev, 0, 0xac);
+	d8 = sc_read(dev, 0, BAR0_00D8);
+	e4 = sc_read(dev, 0, 0xe4);
 
-	/* Command 1: Write 0x01 to MCU subaddress 0x10 (pipeline enable).
-	 * Original cfg_unknownpart2: intended [START][0x64][0x10][0x01][STOP]
-	 */
-	wbuf[0] = 0;    /* dummy, skipped by sc0710_i2c_write */
-	wbuf[1] = 0x10; /* MCU subaddress */
-	wbuf[2] = 0x01; /* value */
-	ret = sc0710_i2c_write(dev, I2C_DEV__ARM_MCU, wbuf, 3);
-	printk(KERN_INFO "%s: MCU write sub=0x10 val=0x01: %s\n",
-		dev->name, ret < 0 ? "NACK" : "ACK");
-
-	msleep(50);
-
-	a8 = sc_read(dev, 0, 0xa8);
-	printk(KERN_INFO "%s: BAR0_A8 after MCU cmd: 0x%08x\n", dev->name, a8);
-
-	/* Command 2: Write {0xAB, 0x03, 0x12, 0x34, 0x57} to device 0x66.
-	 * Original cfg_unknownpart: intended [START][0x66][0xAB][0x03][0x12][0x34][0x57][STOP]
-	 */
-	wbuf[0] = 0;    /* dummy, skipped */
-	wbuf[1] = 0xAB;
-	wbuf[2] = 0x03;
-	wbuf[3] = 0x12;
-	wbuf[4] = 0x34;
-	wbuf[5] = 0x57;
-	ret = sc0710_i2c_write(dev, I2C_DEV__UNKNOWN, wbuf, 6);
-	printk(KERN_INFO "%s: 0x66 write {AB,03,12,34,57}: %s\n",
-		dev->name, ret < 0 ? "NACK" : "ACK");
-
-	msleep(50);
-
-	a8 = sc_read(dev, 0, 0xa8);
-	printk(KERN_INFO "%s: BAR0_A8 after 0x66 cmd: 0x%08x\n", dev->name, a8);
-
-	/* Command 3: Also try the "buggy" original behavior — send bare 0x01
-	 * to MCU without subaddress, in case MCU interprets single-byte writes
-	 * as commands.
-	 * This is what the original code actually did: [START][0x64][0x01][STOP]
-	 */
-	wbuf[0] = 0;    /* dummy, skipped */
-	wbuf[1] = 0x01; /* bare command byte */
-	ret = sc0710_i2c_write(dev, I2C_DEV__ARM_MCU, wbuf, 2);
-	printk(KERN_INFO "%s: MCU bare cmd 0x01: %s\n",
-		dev->name, ret < 0 ? "NACK" : "ACK");
-
-	msleep(100);
-
-	a8 = sc_read(dev, 0, 0xa8);
-	printk(KERN_INFO "%s: BAR0_A8 after bare cmd: 0x%08x\n", dev->name, a8);
-
-	/* Read BAR0 pipeline status */
-	{
-		u32 d8 = sc_read(dev, 0, BAR0_00D8);
-		u32 e4 = sc_read(dev, 0, 0xe4);
-		u32 ac = sc_read(dev, 0, 0xac);
-		printk(KERN_INFO "%s: Pipeline: A8=%08x AC=%08x D8=%08x E4=%08x\n",
-			dev->name, a8, ac, d8, e4);
-	}
+	printk(KERN_INFO "%s: Pipeline before DMA: A8=%08x AC=%08x D8=%08x E4=%08x\n",
+		dev->name, a8, ac, d8, e4);
 
 	return 0;
 }
 
 int sc0710_i2c_initialize(struct sc0710_dev *dev)
 {
-	//sc0710_i2c_cfg_unknownpart2(dev);
-
-	return 0; /* Success */
+	return 0;
 }
 
