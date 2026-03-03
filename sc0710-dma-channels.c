@@ -96,13 +96,9 @@ int sc0710_dma_channels_start(struct sc0710_dev *dev)
 	} else {
 		sc_write(dev, 0, BAR0_00C8, 0x438); /* 1080 default */
 	}
+	sc_write(dev, 0, BAR0_00D8, 0x438);  /* Scaler output height (1080p) */
 	sc_write(dev, 0, BAR0_00DC, 0x1050); /* Pipeline control */
 	sc_write(dev, 0, BAR0_00D0, 0x4100);
-
-	/* Scaler output height must be written after pipeline is initialized.
-	 * On the 4K Pro, writing D8 before D0=0x4100 is silently ignored.
-	 */
-	sc_write(dev, 0, BAR0_00D8, 0x438);
 
 	/* Start all DMA channels. */
 	for (i = 0; i < SC0710_MAX_CHANNELS; i++) {
@@ -110,6 +106,14 @@ int sc0710_dma_channels_start(struct sc0710_dev *dev)
 	}
 
 	sc_set(dev, 0, BAR0_00D0, 0x0001);
+
+	/* Enable FPGA streaming pipeline.
+	 * 0xEC=1 triggers the FPGA to start pushing data to the XDMA engine.
+	 * 0x100=0xC8 purpose unknown but present during Windows streaming.
+	 * Without 0xEC, the pipeline stays idle (D8/E4/A8 all read 0).
+	 */
+	sc_write(dev, 0, 0x100, 0xc8);
+	sc_write(dev, 0, 0xec, 0x01);
 
 	return 0;
 }
