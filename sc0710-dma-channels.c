@@ -67,7 +67,6 @@ void sc0710_dma_channels_stop(struct sc0710_dev *dev)
 
 	printk("%s()\n", __func__);
 
-	sc_write(dev, 0, BAR0_00E4, 0x0000);
 	sc_clr(dev, 0, BAR0_00D0, 0x0001);
 
 	for (i = 0; i < SC0710_MAX_CHANNELS; i++) {
@@ -80,6 +79,15 @@ int sc0710_dma_channels_start(struct sc0710_dev *dev)
 	int i, ret;
 
 	printk("%s()\n", __func__);
+
+	/* Enable LT6911 HDMI receiver output before starting FPGA pipeline.
+	 * The FPGA needs video data from the receiver to activate its pipeline.
+	 */
+	if (dev->board == SC0710_BOARD_ELGATEO_4KP) {
+		mutex_lock(&dev->signalMutex);
+		sc0710_lt6911_enable_output(dev);
+		mutex_unlock(&dev->signalMutex);
+	}
 
 	/* Prepare all DMA channels to start */
 	for (i = 0; i < SC0710_MAX_CHANNELS; i++) {
@@ -110,12 +118,6 @@ int sc0710_dma_channels_start(struct sc0710_dev *dev)
 	}
 
 	sc_set(dev, 0, BAR0_00D0, 0x0001);
-
-	/* Enable streaming - this register appears as 1 during active streaming
-	 * in the Windows register dump and 0 when idle. Writing 1 may be
-	 * required to tell the FPGA to start producing AXI stream data.
-	 */
-	sc_write(dev, 0, BAR0_00E4, 0x0001);
 
 	/* Debug: verify register state after start */
 	if (sc0710_debug_mode) {
