@@ -98,23 +98,11 @@ int sc0710_dma_channels_start(struct sc0710_dev *dev)
 	} else {
 		sc_write(dev, 0, BAR0_00C8, 0x438); /* 1080 default */
 	}
-
-	/* Pipeline input configuration - required for FPGA to process video.
-	 * Value 0x000f0000 observed in Windows BAR dump during active capture.
-	 * Must be set before D8 (scaler output height) becomes writable.
+	sc_write(dev, 0, BAR0_00D0, 0x4100);
+	/* Original mk2 sequence: 0xCC=0, 0xDC=0, D0=0x4300, D0=0x4100
+	 * Skip 0xCC and 0xDC writes — let the card handle those itself.
 	 */
-	sc_write(dev, 0, 0xc4, 0x000f0000);
-
-	sc_write(dev, 0, BAR0_00D8, 0x438);  /* Scaler output height (1080p) */
-	sc_write(dev, 0, BAR0_00DC, 0x1050); /* Pipeline control */
-
-	/* Enable FPGA streaming pipeline BEFORE starting DMA.
-	 * The FPGA may need to be armed before the DMA engine starts
-	 * fetching descriptors, so data is ready when the engine runs.
-	 */
-	sc_write(dev, 0, 0x100, 0xc8);
-	sc_write(dev, 0, 0xec, 0x01);
-
+	sc_write(dev, 0, BAR0_00D0, 0x4300);
 	sc_write(dev, 0, BAR0_00D0, 0x4100);
 
 	/* Start all DMA channels. */
