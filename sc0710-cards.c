@@ -28,6 +28,9 @@ struct sc0710_board sc0710_boards[] = {
 	[SC0710_BOARD_ELGATEO_4KP60_MK2] = {
 		.name		= "Elgato 4k60 Pro mk.2",
 	},
+	[SC0710_BOARD_ELGATEO_4KP] = {
+		.name		= "Elgato 4K Pro",
+	},
 };
 const unsigned int sc0710_bcount = ARRAY_SIZE(sc0710_boards);
 
@@ -36,6 +39,10 @@ struct sc0710_subid sc0710_subids[] = {
 		.subvendor = 0x1cfa,
 		.subdevice = 0x000e,
 		.card      = SC0710_BOARD_ELGATEO_4KP60_MK2,
+	}, {
+		.subvendor = 0x1cfa,
+		.subdevice = 0x0012,
+		.card      = SC0710_BOARD_ELGATEO_4KP,
 	}
 };
 const unsigned int sc0710_idcount = ARRAY_SIZE(sc0710_subids);
@@ -72,6 +79,7 @@ void sc0710_gpio_setup(struct sc0710_dev *dev)
 {
 	switch (dev->board) {
 	case SC0710_BOARD_ELGATEO_4KP60_MK2:
+	case SC0710_BOARD_ELGATEO_4KP:
 		break;
 	}
 }
@@ -80,6 +88,7 @@ void sc0710_card_setup(struct sc0710_dev *dev)
 {
 	switch (dev->board) {
 	case SC0710_BOARD_ELGATEO_4KP60_MK2:
+	case SC0710_BOARD_ELGATEO_4KP:
 		sc_write(dev, 0, BAR0_00C4, 0x000f0000);
 		sc_write(dev, 1, BAR1_0094, 0x00fffe3e);
 		sc_write(dev, 1, BAR1_0008, 0x00fffe3e);

@@ -98,6 +98,7 @@ extern unsigned int sc0710_debug_mode;
 #define SC0710_BOARD_NOAUTO              UNSET
 #define SC0710_BOARD_UNKNOWN             0
 #define SC0710_BOARD_ELGATEO_4KP60_MK2   1
+#define SC0710_BOARD_ELGATEO_4KP         2
 
 struct sc0710_board {
 	char *name;

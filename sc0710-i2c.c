@@ -370,7 +370,18 @@ int sc0710_i2c_read_hdmi_status(struct sc0710_dev *dev)
 	if (rbuf[8]) {
 		u32 new_pixelLineH, new_pixelLineV;
 		int timing_changed = 0;
-		
+
+		/* Dump raw I2C buffer for reverse engineering */
+		if (sc0710_debug_mode) {
+			printk(KERN_INFO "%s: I2C raw: %02x %02x %02x %02x  %02x %02x %02x %02x  %02x %02x %02x %02x  %02x %02x %02x %02x  %02x %02x %02x %02x\n",
+				dev->name,
+				rbuf[0x00], rbuf[0x01], rbuf[0x02], rbuf[0x03],
+				rbuf[0x04], rbuf[0x05], rbuf[0x06], rbuf[0x07],
+				rbuf[0x08], rbuf[0x09], rbuf[0x0a], rbuf[0x0b],
+				rbuf[0x0c], rbuf[0x0d], rbuf[0x0e], rbuf[0x0f],
+				rbuf[0x10], rbuf[0x11], rbuf[0x12], rbuf[0x13]);
+		}
+
 		dev->locked = 1;
 		
 		/* If we have a lock, a cable is definitely connected */

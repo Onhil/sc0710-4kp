@@ -12,9 +12,9 @@ TARFILES = Makefile *.h *.c *.txt *.md
 KVERSION = $(shell uname -r)
 VERSION := $(shell cat version)
 all:
-	make -C /lib/modules/$(KVERSION)/build M=$(PWD) EXTRA_CFLAGS="-DSC0710_DRV_VERSION=\\\"$(VERSION)\\\"" modules
+	make -C /lib/modules/$(KVERSION)/build M=$(PWD) LLVM=1 EXTRA_CFLAGS="-DSC0710_DRV_VERSION=\\\"$(VERSION)\\\"" modules
 clean:
-	make -C /lib/modules/$(KVERSION)/build M=$(PWD) clean
+	make -C /lib/modules/$(KVERSION)/build M=$(PWD) LLVM=1 clean
 
 load:	all
 	sudo dmesg -c >/dev/null
@@ -23,13 +23,13 @@ load:	all
 	sudo modprobe videobuf2-common
 	sudo modprobe videodev
 	#sudo modprobe videobuf-dma-sg
-	sudo modprobe videobuf-vmalloc
+	sudo modprobe videobuf2-vmalloc
 	sudo insmod ./sc0710.ko \
 		thread_dma_poll_interval_ms=2 \
 		dma_status=0
 
 unload:
-	sudo rmmod sc0710
+	sudo rmmod -f sc0710
 	sync
 
 tarball:
