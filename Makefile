@@ -29,6 +29,8 @@ load:	all
 		dma_status=0
 
 unload:
+	# Only real way to remove the module due to the module not dereferencing itself
+	# Decent chance this causes kernel issues if unlucky
 	sudo rmmod -f sc0710
 	sync
 
