@@ -694,10 +694,23 @@ int sc0710_dma_channel_start_prep(struct sc0710_dma_channel *ch)
 	if (ch->state == STATE_RUNNING)
 		return 0;
 
+	/* Stop engine first */
 	sc_write(ch->dev, 1, ch->reg_dma_control_w1c, 0x00000001);
 
+	/* Full XDMA engine reset (Xilinx reference sequence).
+	 * Without this, the engine may be wedged from a previous load.
+	 */
+	sc_write(ch->dev, 1, ch->reg_dma_control_w1s, 0x01000000); /* Assert reset (bit 24) */
+	mdelay(1);
+	sc_write(ch->dev, 1, ch->reg_dma_control_w1c, 0x01000001); /* Clear reset + run */
+
+	/* Re-apply IE bits after reset cleared the control register */
+	sc_write(ch->dev, 1, ch->reg_dma_control_w1s, 0x00fffe7e);
+	/* Re-apply interrupt enable register */
+	sc_write(ch->dev, 1, ch->register_dma_base + 0x94, 0x00fffe7e);
+
 	ch->dma_completed_descriptor_count_last = 0;
-	sc_write(ch->dev, 1, ch->reg_dma_completed_descriptor_count, 1);
+	sc_write(ch->dev, 1, ch->reg_dma_completed_descriptor_count, 0);
 	sc_write(ch->dev, 1, ch->reg_sg_start_h, ch->pt_dma >> 32);
 	sc_write(ch->dev, 1, ch->reg_sg_start_l, ch->pt_dma);
 	sc_write(ch->dev, 1, ch->reg_sg_adj, 0);
@@ -729,6 +742,15 @@ int sc0710_dma_channel_start(struct sc0710_dma_channel *ch)
 	if (ch->state == STATE_RUNNING)
 		return 0;
 
+	if (sc0710_debug_mode) {
+		u32 sg_id = sc_read(ch->dev, 1, ch->register_sg_base);
+		u32 s1 = sc_read(ch->dev, 1, ch->reg_dma_status1);
+		printk(KERN_INFO "%s: ch#%d PRE-START: sg_id=%08x s1=%08x sg_base=0x%04x sg_cred_reg=0x%04x total_desc=%d\n",
+			ch->dev->name, ch->nr, sg_id, s1,
+			ch->register_sg_base, ch->reg_sg_credits,
+			ch->sg_total_descriptors);
+	}
+
 	sc_write(ch->dev, 1, ch->reg_dma_control_w1s, 0x00000001);
 
 	/* Write SG credits after run bit is set.
@@ -736,6 +758,27 @@ int sc0710_dma_channel_start(struct sc0710_dma_channel *ch)
 	 * before credits are accepted.
 	 */
 	sc_write(ch->dev, 1, ch->reg_sg_credits, ch->sg_total_descriptors);
+
+	if (sc0710_debug_mode) {
+		u32 cred_readback, s1, ctrl, desc;
+
+		cred_readback = sc_read(ch->dev, 1, ch->reg_sg_credits);
+		s1 = sc_read(ch->dev, 1, ch->reg_dma_status1);
+		ctrl = sc_read(ch->dev, 1, ch->reg_dma_control);
+		desc = sc_read(ch->dev, 1, ch->reg_dma_completed_descriptor_count);
+		printk(KERN_INFO "%s: ch#%d POST-CREDIT: cred=%08x s1=%08x ctrl=%08x desc=%d\n",
+			ch->dev->name, ch->nr, cred_readback, s1, ctrl, desc);
+
+		/* Check engine state after delay — differentiates between
+		 * stuck-on-fetch (BUSY) vs waiting-for-stream-data (BUSY)
+		 * vs completed transfers (DESCRIPTOR_COMPLETED).
+		 */
+		msleep(100);
+		s1 = sc_read(ch->dev, 1, ch->reg_dma_status1);
+		desc = sc_read(ch->dev, 1, ch->reg_dma_completed_descriptor_count);
+		printk(KERN_INFO "%s: ch#%d AFTER-100ms: s1=%08x desc=%d\n",
+			ch->dev->name, ch->nr, s1, desc);
+	}
 
 	ch->state = STATE_RUNNING;
 	return 0;

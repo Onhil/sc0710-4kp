@@ -98,19 +98,59 @@ int sc0710_dma_channels_start(struct sc0710_dev *dev)
 	} else {
 		sc_write(dev, 0, BAR0_00C8, 0x438); /* 1080 default */
 	}
-	sc_write(dev, 0, BAR0_00D0, 0x4100);
-	/* Original mk2 sequence: 0xCC=0, 0xDC=0, D0=0x4300, D0=0x4100
-	 * Skip 0xCC and 0xDC writes — let the card handle those itself.
+
+	/* Set scaler output height for 4KP (always 1080p output).
+	 * Windows sets D8=0x438. Without this, the FPGA scaler produces
+	 * no output and the XDMA C2H engine gets no AXI-Stream data.
 	 */
+	if (dev->board == SC0710_BOARD_ELGATEO_4KP) {
+		sc_write(dev, 0, BAR0_00D8, 0x438);
+	}
+
+	sc_write(dev, 0, BAR0_00D0, 0x4100);
+	sc_write(dev, 0, 0xCC, 0x00000000);
+	/* DC: mk2 uses 0 (no scaler). 4KP: Windows shows DC=0x1050 during
+	 * streaming — don't clear it, let the FPGA set it during activation.
+	 */
+	if (dev->board != SC0710_BOARD_ELGATEO_4KP)
+		sc_write(dev, 0, BAR0_00DC, 0x00000000);
 	sc_write(dev, 0, BAR0_00D0, 0x4300);
 	sc_write(dev, 0, BAR0_00D0, 0x4100);
 
-	/* Start all DMA channels. */
+	/* Enable the pipeline BEFORE starting DMA.
+	 * On 4KP, A8 takes ~400ms to become non-zero after D0|=1.
+	 * The XDMA C2H engine stalls if started without stream data.
+	 */
+	sc_set(dev, 0, BAR0_00D0, 0x0001);
+
+	/* Enable scaler-to-DMA data path. Windows has EC=1 during streaming.
+	 * Without this, the FPGA scaler processes video (A8 active) but
+	 * doesn't route output to the XDMA C2H AXI-Stream interface.
+	 */
+	if (dev->board == SC0710_BOARD_ELGATEO_4KP)
+		sc_write(dev, 0, 0xEC, 0x00000001);
+
+	if (dev->board == SC0710_BOARD_ELGATEO_4KP) {
+		int poll;
+		u32 a8;
+		for (poll = 0; poll < 20; poll++) {
+			msleep(100);
+			a8 = sc_read(dev, 0, 0xa8);
+			if (a8 != 0) {
+				printk(KERN_INFO "%s: A8 active after %dms: %08x\n",
+					dev->name, (poll + 1) * 100, a8);
+				break;
+			}
+		}
+		if (a8 == 0)
+			printk(KERN_WARNING "%s: A8 still 0 after 2s — DMA may stall\n",
+				dev->name);
+	}
+
+	/* Start all DMA channels after pipeline is active. */
 	for (i = 0; i < SC0710_MAX_CHANNELS; i++) {
 		ret = sc0710_dma_channel_start(&dev->channel[i]);
 	}
-
-	sc_set(dev, 0, BAR0_00D0, 0x0001);
 
 	/* Debug: verify register state after start */
 	if (sc0710_debug_mode) {
@@ -150,7 +190,13 @@ int sc0710_dma_channels_start(struct sc0710_dev *dev)
 			sc_read(dev, 0, 0x1064),
 			sc_read(dev, 0, 0x1070));
 
-		/* MCU dump removed — probing 0x66 corrupts I2C bus and kills MCU */
+		/* XDMA config block — verify engine configuration */
+		printk(KERN_INFO "%s: XDMA config: 0x3008=%08x 0x300C=%08x 0x3018=%08x 0x304C=%08x\n",
+			dev->name,
+			sc_read(dev, 1, 0x3008),
+			sc_read(dev, 1, 0x300c),
+			sc_read(dev, 1, 0x3018),
+			sc_read(dev, 1, 0x304c));
 	}
 
 	return 0;

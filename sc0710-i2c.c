@@ -37,9 +37,13 @@ static int didack(struct sc0710_dev *dev)
 
 	while (cnt-- > 0) {
 		v = sc_read(dev, 0, BAR0_3104);
-		if ((v == 0x44) || (v == 0xc0) || (v == 0x40)) {
+		/* TX_FIFO_Empty (bit 7) = data consumed/sent.
+		 * BB (bit 2) = bus busy, slave ACK'd.
+		 * Either condition indicates successful transmission.
+		 * Known values: 0x44 (mk2), 0xC0, 0xC4 (4KP after soft reset).
+		 */
+		if ((v & 0x80) || (v & 0x04))
 			return 1; /* device Ack'd */
-		}
 		udelay(64);
 	}
 
@@ -393,10 +397,11 @@ int sc0710_i2c_read_hdmi_status(struct sc0710_dev *dev)
 		u32 new_pixelLineH, new_pixelLineV;
 		int timing_changed = 0;
 
-		/* Dump raw I2C buffer for reverse engineering */
+		/* Dump raw I2C buffer + A8 pipeline status */
 		if (sc0710_debug_mode) {
-			printk(KERN_INFO "%s: I2C raw: %02x %02x %02x %02x  %02x %02x %02x %02x  %02x %02x %02x %02x  %02x %02x %02x %02x  %02x %02x %02x %02x\n",
-				dev->name,
+			u32 a8_poll = sc_read(dev, 0, 0xa8);
+			printk(KERN_INFO "%s: I2C raw [A8=%08x]: %02x %02x %02x %02x  %02x %02x %02x %02x  %02x %02x %02x %02x  %02x %02x %02x %02x  %02x %02x %02x %02x\n",
+				dev->name, a8_poll,
 				rbuf[0x00], rbuf[0x01], rbuf[0x02], rbuf[0x03],
 				rbuf[0x04], rbuf[0x05], rbuf[0x06], rbuf[0x07],
 				rbuf[0x08], rbuf[0x09], rbuf[0x0a], rbuf[0x0b],
@@ -914,39 +919,57 @@ int sc0710_i2c_initialize(struct sc0710_dev *dev)
 
 	mutex_lock(&dev->signalMutex);
 
-	/* Diagnostic: check I2C controller state after card_setup() soft reset + timing config */
+	/* Diagnostic: check all 8 IIC instance states after soft reset */
 	{
-		u32 sr = sc_read(dev, 0, BAR0_3104);
-		u32 cr = sc_read(dev, 0, BAR0_3100);
-		printk(KERN_INFO "%s: I2C controller after card_setup: CR=%08x SR=%08x\n",
-			dev->name, cr, sr);
+		int iic;
+		printk(KERN_INFO "%s: IIC instance states after card_setup:\n", dev->name);
+		for (iic = 0; iic < 8; iic++) {
+			u32 base = 0x3000 + (iic * 0x200);
+			u32 sr = sc_read(dev, 0, base + 0x104);
+			u32 cr = sc_read(dev, 0, base + 0x100);
+			printk(KERN_INFO "%s:   IIC #%d (base 0x%04x): CR=%08x SR=%08x\n",
+				dev->name, iic, base, cr, sr);
+		}
+	}
+
+	/* Check A8 BEFORE any commands — detect residual state from previous load */
+	{
+		u32 a8_pre = sc_read(dev, 0, 0xa8);
+		printk(KERN_INFO "%s: A8 pre-init (residual): %08x\n", dev->name, a8_pre);
 	}
 
 	/* Wait for MCU to be ready after PCI enumeration */
 	msleep(500);
 
-	/* Send original upstream init commands (were #if 0'd out in mk2 code).
+	/* Send init commands to MCU and LT6911 proxy.
 	 * sc0710_i2c_write() skips wbuf[0], so wbuf[0] is a dummy byte.
-	 *
-	 * cfg_unknownpart2: Write 0x01 to MCU (0x64). On wire: [0x64+W][0x01]
-	 * cfg_unknownpart: Write {0x03, 0x12, 0x34, 0x57} to LT6911 proxy (0x66).
 	 */
 	{
-		u8 mcu_cmd[2] = { 0x10, 0x01 };
-		u8 lt_cmd[5] = { 0xAB, 0x03, 0x12, 0x34, 0x57 };
+		u8 mcu_cmd_raw[2] = { 0x00, 0x01 };
+		u8 lt_cmd[5] = { 0x00, 0x03, 0x12, 0x34, 0x57 };
+		int poll;
+		u32 a8;
 
-		ret = sc0710_i2c_write(dev, I2C_DEV__ARM_MCU, mcu_cmd, sizeof(mcu_cmd));
-		printk(KERN_INFO "%s: MCU init write: ret=%d\n", dev->name, ret);
+		/* cfg_unknownpart2: send 0x01 to MCU */
+		ret = sc0710_i2c_write(dev, I2C_DEV__ARM_MCU, mcu_cmd_raw, sizeof(mcu_cmd_raw));
+		printk(KERN_INFO "%s: MCU cmd 0x01: ret=%d\n", dev->name, ret);
 
 		msleep(50);
 
+		/* cfg_unknownpart: send {0x03, 0x12, 0x34, 0x57} to 0x66 */
 		ret = sc0710_i2c_write(dev, I2C_DEV__UNKNOWN, lt_cmd, sizeof(lt_cmd));
-		printk(KERN_INFO "%s: LT6911 init write: ret=%d\n", dev->name, ret);
+		printk(KERN_INFO "%s: LT6911 init: ret=%d\n", dev->name, ret);
 
-		msleep(200);
-
-		printk(KERN_INFO "%s: Init cmds sent, A8=%08x\n",
-			dev->name, sc_read(dev, 0, 0xa8));
+		/* Poll A8 for up to 10 seconds — LT6911 may need time to start output */
+		for (poll = 0; poll < 20; poll++) {
+			msleep(500);
+			a8 = sc_read(dev, 0, 0xa8);
+			if (poll % 4 == 0 || a8 != 0)
+				printk(KERN_INFO "%s: A8 poll %d/%d: %08x\n",
+					dev->name, poll, 20, a8);
+			if (a8 != 0)
+				break;
+		}
 	}
 
 	for (subaddr = 0x00; ; subaddr += 0x10) {
@@ -982,7 +1005,56 @@ int sc0710_i2c_initialize(struct sc0710_dev *dev)
 		if (subaddr >= 0xF0)
 			break;
 	}
+
+	/* Probe LT6911 at 0x66 — now safe with I2C soft reset applied.
+	 * Read sub-address 0x00 to check if chip responds with real data.
+	 */
+	printk(KERN_INFO "%s: Probing LT6911 (0x66):\n", dev->name);
+	{
+		u8 lt_wbuf[1] = { 0x00 };
+		u8 lt_rbuf[0x10];
+
+		memset(lt_rbuf, 0, sizeof(lt_rbuf));
+		ret = __sc0710_i2c_writeread(dev, I2C_DEV__UNKNOWN,
+			lt_wbuf, sizeof(lt_wbuf), lt_rbuf, sizeof(lt_rbuf));
+		if (ret < 0) {
+			printk(KERN_INFO "%s:   0x66 sub=0x00: ERROR %d\n",
+				dev->name, ret);
+		} else {
+			printk(KERN_INFO "%s:   0x66 sub=0x00: %02x %02x %02x %02x  %02x %02x %02x %02x  %02x %02x %02x %02x  %02x %02x %02x %02x\n",
+				dev->name,
+				lt_rbuf[0], lt_rbuf[1], lt_rbuf[2], lt_rbuf[3],
+				lt_rbuf[4], lt_rbuf[5], lt_rbuf[6], lt_rbuf[7],
+				lt_rbuf[8], lt_rbuf[9], lt_rbuf[10], lt_rbuf[11],
+				lt_rbuf[12], lt_rbuf[13], lt_rbuf[14], lt_rbuf[15]);
+		}
+
+		/* Also try sub-address 0x00 with a small read for chip ID */
+		lt_wbuf[0] = 0x00;
+		memset(lt_rbuf, 0, sizeof(lt_rbuf));
+		ret = __sc0710_i2c_writeread(dev, I2C_DEV__UNKNOWN,
+			lt_wbuf, sizeof(lt_wbuf), lt_rbuf, 4);
+		if (ret == 0) {
+			printk(KERN_INFO "%s:   0x66 chip ID area: %02x %02x %02x %02x\n",
+				dev->name,
+				lt_rbuf[0], lt_rbuf[1], lt_rbuf[2], lt_rbuf[3]);
+		}
+	}
+
 	mutex_unlock(&dev->signalMutex);
+
+	/* Pipeline register dump — compare with Windows values */
+	printk(KERN_INFO "%s: Pipeline regs: 00=%08x 04=%08x 08=%08x\n",
+		dev->name,
+		sc_read(dev, 0, 0x00),
+		sc_read(dev, 0, 0x04),
+		sc_read(dev, 0, 0x08));
+	printk(KERN_INFO "%s: Pipeline regs: A8=%08x AC=%08x D4=%08x E4=%08x\n",
+		dev->name,
+		sc_read(dev, 0, 0xa8),
+		sc_read(dev, 0, 0xac),
+		sc_read(dev, 0, 0xd4),
+		sc_read(dev, 0, 0xe4));
 
 	return 0;
 }

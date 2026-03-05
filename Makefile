@@ -26,7 +26,7 @@ load:	all
 	sudo modprobe videobuf2-vmalloc
 	sudo insmod ./sc0710.ko \
 		thread_dma_poll_interval_ms=2 \
-		dma_status=0 debug=1
+		dma_status=0 debug=1 msi_enable=1
 
 unload:
 	sudo rmmod -f sc0710

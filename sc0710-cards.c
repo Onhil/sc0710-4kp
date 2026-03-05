@@ -91,25 +91,30 @@ void sc0710_card_setup(struct sc0710_dev *dev)
 	case SC0710_BOARD_ELGATEO_4KP:
 		sc_write(dev, 0, BAR0_00C4, 0x000f0000);
 
-		/* Soft reset the AXI IIC controller (IP base 0x3000).
-		 * SOFTR at offset 0x040, key value 0x0A.
-		 * Without this, the 4KP's I2C controller starts wedged —
-		 * TX FIFO never drains and bus never goes busy.
+		/* Soft reset and configure all 8 AXI IIC instances (0x3000-0x3E00).
+		 * Windows driver initializes all 8 identically. Each instance is
+		 * at a 0x200 offset: SOFTR at base+0x040, timing at base+0x128..0x144.
+		 * Without the soft reset, the 4KP's I2C controller starts wedged.
 		 */
-		sc_write(dev, 0, 0x3040, 0x0000000a);
-		udelay(10);
-
-		/* AXI IIC timing registers — match Windows driver values.
-		 * These configure I2C bus timing for AXI IIC controller #0.
-		 */
-		sc_write(dev, 0, 0x3128, 0x0000002d); /* TSUSTA */
-		sc_write(dev, 0, 0x312c, 0x0000002d); /* TSUSTO */
-		sc_write(dev, 0, 0x3130, 0x0000002d); /* THDSTA */
-		sc_write(dev, 0, 0x3134, 0x00000014); /* TSUDAT */
-		sc_write(dev, 0, 0x3138, 0x00000050); /* TBUF */
-		sc_write(dev, 0, 0x313c, 0x00000076); /* THIGH */
-		sc_write(dev, 0, 0x3140, 0x00000076); /* TLOW */
-		sc_write(dev, 0, 0x3144, 0x00000001); /* THDDAT */
+		{
+			int iic;
+			for (iic = 0; iic < 8; iic++) {
+				u32 base = 0x3000 + (iic * 0x200);
+				sc_write(dev, 0, base + 0x040, 0x0000000a); /* SOFTR */
+			}
+			udelay(10);
+			for (iic = 0; iic < 8; iic++) {
+				u32 base = 0x3000 + (iic * 0x200);
+				sc_write(dev, 0, base + 0x128, 0x0000002d); /* TSUSTA */
+				sc_write(dev, 0, base + 0x12c, 0x0000002d); /* TSUSTO */
+				sc_write(dev, 0, base + 0x130, 0x0000002d); /* THDSTA */
+				sc_write(dev, 0, base + 0x134, 0x00000014); /* TSUDAT */
+				sc_write(dev, 0, base + 0x138, 0x00000050); /* TBUF */
+				sc_write(dev, 0, base + 0x13c, 0x00000076); /* THIGH */
+				sc_write(dev, 0, base + 0x140, 0x00000076); /* TLOW */
+				sc_write(dev, 0, base + 0x144, 0x00000001); /* THDDAT */
+			}
+		}
 
 		sc_write(dev, 1, BAR1_0094, 0x00fffe3e);
 		sc_write(dev, 1, BAR1_0008, 0x00fffe3e);
