@@ -708,64 +708,6 @@ int sc0710_i2c_read_procamp(struct sc0710_dev *dev)
 	return 0; /* Success */
 }
 
-/* Write a single register to the LT6911 HDMI receiver via bank-switched I2C.
- * Bank is selected by writing the bank number to register 0xFF first.
- * Note: sc0710_i2c_write skips wbuf[0], so we put a dummy byte there.
- */
-static int lt6911_write_reg(struct sc0710_dev *dev, u8 bank, u8 reg, u8 val)
-{
-	u8 wbuf[3];
-	int ret;
-
-	/* Select bank: write 0xFF = bank */
-	wbuf[0] = 0; /* dummy, skipped by sc0710_i2c_write */
-	wbuf[1] = 0xFF;
-	wbuf[2] = bank;
-	ret = sc0710_i2c_write(dev, I2C_DEV__UNKNOWN, wbuf, 3);
-	if (ret < 0) {
-		printk(KERN_ERR "%s: LT6911 bank select 0x%02x failed: %d\n",
-			dev->name, bank, ret);
-		return ret;
-	}
-
-	/* Write register within selected bank */
-	wbuf[1] = reg;
-	wbuf[2] = val;
-	ret = sc0710_i2c_write(dev, I2C_DEV__UNKNOWN, wbuf, 3);
-	if (ret < 0) {
-		printk(KERN_ERR "%s: LT6911 write bank 0x%02x reg 0x%02x = 0x%02x failed: %d\n",
-			dev->name, bank, reg, val, ret);
-		return ret;
-	}
-
-	return 0;
-}
-
-/* Read a single register from the LT6911 via bank-switched I2C. */
-static int lt6911_read_reg(struct sc0710_dev *dev, u8 bank, u8 reg, u8 *val)
-{
-	u8 wbuf[3];
-	u8 rbuf[1];
-	int ret;
-
-	/* Select bank */
-	wbuf[0] = 0;
-	wbuf[1] = 0xFF;
-	wbuf[2] = bank;
-	ret = sc0710_i2c_write(dev, I2C_DEV__UNKNOWN, wbuf, 3);
-	if (ret < 0)
-		return ret;
-
-	/* Read register */
-	wbuf[0] = reg;
-	ret = __sc0710_i2c_writeread(dev, I2C_DEV__UNKNOWN, wbuf, 1, rbuf, 1);
-	if (ret < 0)
-		return ret;
-
-	*val = rbuf[0];
-	return 0;
-}
-
 /* Send init commands to MCU/LT6911 and check pipeline status before DMA start.
  * These are the original cfg_unknownpart/cfg_unknownpart2 commands from the
  * upstream mk2 driver (were #if 0'd out). Note: sc0710_i2c_write() skips
