@@ -29,6 +29,7 @@
 #define I2C_DEV__ARM_MCU (0x32 << 1)
 #define I2C_DEV__UNKNOWN (0x33 << 1)
 
+#if 1 /* Enable I2C write for tone mapping control */
 static int didack(struct sc0710_dev *dev)
 {
 	u32 v = 0;
@@ -48,6 +49,7 @@ static int didack(struct sc0710_dev *dev)
 
 	return 0; /* No Ack */
 }
+#endif
 
 static u8 busread(struct sc0710_dev *dev)
 {
@@ -77,6 +79,7 @@ static u8 busread(struct sc0710_dev *dev)
 	return v;
 }
 
+#if 1 /* Enable I2C write for MCU commands */
 /* Assumes 8 bit device address and 8 bit sub address. */
 static int sc0710_i2c_write(struct sc0710_dev *dev, u8 devaddr8bit, u8 *wbuf, int wlen)
 {
@@ -103,6 +106,7 @@ static int sc0710_i2c_write(struct sc0710_dev *dev, u8 devaddr8bit, u8 *wbuf, in
 
 	return 0; /* Success */
 }
+#endif
 
 /* Public I2C write function */
 int sc0710_i2c_write_mcu(struct sc0710_dev *dev, u8 subaddr, u8 *data, int len)
