@@ -536,11 +536,11 @@ const struct sc0710_format *sc0710_format_find_by_timing_and_rate(u32 timingH, u
 			if (sc0710_debug_mode)
 				printk(KERN_INFO "sc0710: Cand %s FPS=%u Diff=%u\n", formats[i].name, fps, diff);
 
-			/* Special handling: If hint implies 60Hz (0x3C), allow 120Hz matches 
+			/* Special handling: If hint implies 60Hz (0x3C), allow 120Hz matches
 			 * as they are often reported ambiguously or 120 is multiple of 60.
 			 * Favor exact match first, but keep track.
 			 */
-			
+
 			if (diff < best_diff) {
 				best_diff = diff;
 				best_fmt = &formats[i];
@@ -584,9 +584,6 @@ const struct sc0710_format *sc0710_format_find_by_timing_and_rate(u32 timingH, u
 
 	return best_fmt;
 }
-
-
-
 
 
 static int vidioc_s_dv_timings(struct file *file, void *_fh, struct v4l2_dv_timings *timings)

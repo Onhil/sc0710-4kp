@@ -29,7 +29,6 @@
 #define I2C_DEV__ARM_MCU (0x32 << 1)
 #define I2C_DEV__UNKNOWN (0x33 << 1)
 
-#if 1 /* Enable I2C write for tone mapping control */
 static int didack(struct sc0710_dev *dev)
 {
 	u32 v = 0;
@@ -47,10 +46,8 @@ static int didack(struct sc0710_dev *dev)
 		udelay(64);
 	}
 
-	printk(KERN_DEBUG "%s: didack NACK, last 3104=%08x\n", dev->name, v);
 	return 0; /* No Ack */
 }
-#endif
 
 static u8 busread(struct sc0710_dev *dev)
 {
@@ -66,6 +63,7 @@ static u8 busread(struct sc0710_dev *dev)
 		}
 
 		v = sc_read(dev, 0, BAR0_3104);
+//printk("readbus %08x\n", v);
 		/* Wait for RX data: RX_FIFO_Empty (bit 6) clear means data available.
 		 * mk2 sees 0x8C/0xAC; 4KP may differ in bus-busy/SRW bits.
 		 */
@@ -79,7 +77,6 @@ static u8 busread(struct sc0710_dev *dev)
 	return v;
 }
 
-#if 1 /* Enable I2C write for MCU commands */
 /* Assumes 8 bit device address and 8 bit sub address. */
 static int sc0710_i2c_write(struct sc0710_dev *dev, u8 devaddr8bit, u8 *wbuf, int wlen)
 {
@@ -106,7 +103,6 @@ static int sc0710_i2c_write(struct sc0710_dev *dev, u8 devaddr8bit, u8 *wbuf, in
 
 	return 0; /* Success */
 }
-#endif
 
 /* Public I2C write function */
 int sc0710_i2c_write_mcu(struct sc0710_dev *dev, u8 subaddr, u8 *data, int len)
@@ -153,7 +149,7 @@ static int __sc0710_i2c_writeread(struct sc0710_dev *dev, u8 devaddr8bit, u8 *wb
 	 */
 	while (cnt > 0) {
 		if (time_after(jiffies, timeout)) {
-			return -ETIMEDOUT;
+			return 0;
 		}
 		v = sc_read(dev, 0, BAR0_3104);
 		if ((v == 0x00000044) || (v == 0x00000040))
@@ -161,6 +157,7 @@ static int __sc0710_i2c_writeread(struct sc0710_dev *dev, u8 devaddr8bit, u8 *wb
 		udelay(50);
 		cnt--;
 	}
+	//dprintk(0, "Read 3104 %08x at cnt %d -- 44?\n", v, cnt);
 	if (cnt <= 0) {
 		return 0; /* Continue anyway — 4KP may not set bus-busy */
 	}
@@ -184,6 +181,7 @@ static int __sc0710_i2c_writeread(struct sc0710_dev *dev, u8 devaddr8bit, u8 *wb
 		udelay(50);
 		cnt--;
 	}
+	//dprintk(0, "Read 3104 %08x at cnt %d -- c4?\n", v, cnt);
 
 	msleep(1); // pkt 15162
 	sc_write(dev, 0, BAR0_3120, 0x0000000f);
@@ -201,15 +199,13 @@ static int __sc0710_i2c_writeread(struct sc0710_dev *dev, u8 devaddr8bit, u8 *wb
 			return -ETIMEDOUT;
 		}
 		*(rbuf + cnt) = busread(dev);
-		//printk("dat[0x%02x] %02x\n", cnt, *(rbuf + cnt)); 
+		//printk("dat[0x%02x] %02x\n", cnt, *(rbuf + cnt));
 		cnt++;
 	}
 	v = sc_read(dev, 0, BAR0_3104);
-	/* Completion: TX_FIFO_Empty (bit 7) + RX_FIFO_Empty (bit 6) = all done.
-	 * mk2 sees 0xC8/0xCC; 4KP may differ in SRW/BB bits.
-	 */
-	if ((v & 0xC0) != 0xC0) {
-		printk("3104 %08x --- completion?\n", v);
+	/* Accept both 0xc8 and 0xcc as valid completion status */
+	if (v != 0xc8 && v != 0xcc) {
+		printk("3104 %08x --- c8/cc?\n", sc_read(dev, 0, BAR0_3104));
 		printk("  ac %08x --- 0?\n", sc_read(dev, 0, BAR0_00AC));
 		return -1;
 	}
@@ -334,14 +330,25 @@ static void sc0710_reset_dma_frame_sync(struct sc0710_dev *dev)
 	/* Phase 2: Resize DMA buffers if needed (for resolution changes) */
 	sc0710_dma_channels_resize(dev);
 
-	/* Phase 3: Start DMA - dma_channels_start() handles all register
-	 * programming (BAR0_00C8, D8, DC, D0, 0xEC, 0x100).
-	 */
+	/* Phase 3: Program hardware registers */
+	if (dev->fmt) {
+		sc_write(dev, 0, BAR0_00C8, dev->fmt->height);
+		printk(KERN_INFO "%s: Reprogrammed height register to %d\n",
+			dev->name, dev->fmt->height);
+	}
+	sc_write(dev, 0, BAR0_00D0, 0x4100);
+	sc_write(dev, 0, 0xcc, 0);
+	sc_write(dev, 0, 0xdc, 0);
+	sc_write(dev, 0, BAR0_00D0, 0x4300);
+	sc_write(dev, 0, BAR0_00D0, 0x4100);
+
+	/* Small delay before restart */
+	msleep(10);
+
+	/* Phase 4: Start DMA */
 	sc0710_dma_channels_start(dev);
 	printk(KERN_INFO "%s: DMA started after signal restoration\n", dev->name);
 }
-
-
 
 int sc0710_i2c_read_hdmi_status(struct sc0710_dev *dev)
 {
@@ -397,18 +404,6 @@ int sc0710_i2c_read_hdmi_status(struct sc0710_dev *dev)
 		u32 new_pixelLineH, new_pixelLineV;
 		int timing_changed = 0;
 
-		/* Dump raw I2C buffer + A8 pipeline status */
-		if (sc0710_debug_mode) {
-			u32 a8_poll = sc_read(dev, 0, 0xa8);
-			printk(KERN_INFO "%s: I2C raw [A8=%08x]: %02x %02x %02x %02x  %02x %02x %02x %02x  %02x %02x %02x %02x  %02x %02x %02x %02x  %02x %02x %02x %02x\n",
-				dev->name, a8_poll,
-				rbuf[0x00], rbuf[0x01], rbuf[0x02], rbuf[0x03],
-				rbuf[0x04], rbuf[0x05], rbuf[0x06], rbuf[0x07],
-				rbuf[0x08], rbuf[0x09], rbuf[0x0a], rbuf[0x0b],
-				rbuf[0x0c], rbuf[0x0d], rbuf[0x0e], rbuf[0x0f],
-				rbuf[0x10], rbuf[0x11], rbuf[0x12], rbuf[0x13]);
-		}
-
 		dev->locked = 1;
 		
 		/* If we have a lock, a cable is definitely connected */
@@ -449,7 +444,6 @@ int sc0710_i2c_read_hdmi_status(struct sc0710_dev *dev)
 		 */
 		dev->eotf = EOTF_SDR;
 
-
 		/* Save old timings to detect changes */
 		new_pixelLineV = rbuf[0x05] << 8 | rbuf[0x04];
 		new_pixelLineH = rbuf[0x07] << 8 | rbuf[0x06];
@@ -478,9 +472,6 @@ int sc0710_i2c_read_hdmi_status(struct sc0710_dev *dev)
 		dev->interlaced = rbuf[0x0d] & 0x01;
 		if (dev->interlaced)
 			dev->height *= 2;
-
-
-
 
 		if (timing_changed || !was_locked) {
 			u32 fps_target = 0;
@@ -565,14 +556,13 @@ int sc0710_i2c_read_hdmi_status(struct sc0710_dev *dev)
 		 * confirming no activity for several consecutive polls.
 		 */
 		int timing_present = (rbuf[4] | rbuf[5] | rbuf[6] | rbuf[7]);
-		
 
 		if (sc0710_debug_mode) {
 			printk(KERN_INFO "%s: DEBUG: rbuf[8]=%02x (lock), rbuf[4-7]=%02x %02x %02x %02x => timing_present=%d, was_locked=%d, count=%d\n",
-				dev->name, rbuf[8], rbuf[4], rbuf[5], rbuf[6], rbuf[7], 
+				dev->name, rbuf[8], rbuf[4], rbuf[5], rbuf[6], rbuf[7],
 				timing_present, was_locked, dev->unlocked_no_timing_count);
 		}
-		
+
 		/* Determine cable status using state machine */
 		if (timing_present) {
 			/* Timing data present - cable definitely connected */
@@ -622,7 +612,7 @@ int sc0710_i2c_read_hdmi_status(struct sc0710_dev *dev)
 				}
 			}
 		}
-		
+
 		if (sc0710_debug_mode) {
 			printk(KERN_INFO "%s: STATUS: %s (cable_connected=%d)\n",
 				dev->name,
@@ -712,98 +702,6 @@ int sc0710_i2c_read_procamp(struct sc0710_dev *dev)
 	}
 
 	return 0; /* Success */
-}
-
-
-
-/* Dump a range of MCU I2C subaddresses for reverse engineering.
- * Reads 16 bytes from each subaddress in steps of 0x10.
- */
-int sc0710_i2c_dump_mcu_regs(struct sc0710_dev *dev)
-{
-	u8 subaddr;
-	u8 wbuf[1];
-	u8 rbuf[0x10];
-	int ret, i, any_nonzero;
-
-	printk(KERN_INFO "%s: MCU register dump (subaddr 0x00-0xFF):\n", dev->name);
-
-	for (subaddr = 0x00; ; subaddr += 0x10) {
-		wbuf[0] = subaddr;
-		memset(rbuf, 0, sizeof(rbuf));
-
-		ret = __sc0710_i2c_writeread(dev, I2C_DEV__ARM_MCU,
-			wbuf, sizeof(wbuf), rbuf, sizeof(rbuf));
-		if (ret < 0) {
-			printk(KERN_INFO "%s:   MCU sub=0x%02x: read error %d\n",
-				dev->name, subaddr, ret);
-			if (subaddr >= 0xF0)
-				break;
-			continue;
-		}
-
-		/* Only print if any byte is non-zero */
-		any_nonzero = 0;
-		for (i = 0; i < 0x10; i++) {
-			if (rbuf[i]) {
-				any_nonzero = 1;
-				break;
-			}
-		}
-		if (any_nonzero) {
-			printk(KERN_INFO "%s:   MCU sub=0x%02x: %02x %02x %02x %02x  %02x %02x %02x %02x  %02x %02x %02x %02x  %02x %02x %02x %02x\n",
-				dev->name, subaddr,
-				rbuf[0], rbuf[1], rbuf[2], rbuf[3],
-				rbuf[4], rbuf[5], rbuf[6], rbuf[7],
-				rbuf[8], rbuf[9], rbuf[10], rbuf[11],
-				rbuf[12], rbuf[13], rbuf[14], rbuf[15]);
-		}
-
-		if (subaddr >= 0xF0)
-			break;
-	}
-
-	/* Also probe the unknown I2C device at 0x33 */
-	printk(KERN_INFO "%s: Probing I2C device 0x66 (0x33):\n", dev->name);
-	for (subaddr = 0x00; ; subaddr += 0x10) {
-		wbuf[0] = subaddr;
-		memset(rbuf, 0, sizeof(rbuf));
-
-		ret = __sc0710_i2c_writeread(dev, I2C_DEV__UNKNOWN,
-			wbuf, sizeof(wbuf), rbuf, sizeof(rbuf));
-		if (ret < 0) {
-			if (subaddr == 0x00)
-				printk(KERN_INFO "%s:   0x66 sub=0x%02x: no ACK (device not present?)\n",
-					dev->name, subaddr);
-			if (subaddr >= 0xF0)
-				break;
-			/* If first address fails, device likely not present - skip rest */
-			if (subaddr == 0x00)
-				break;
-			continue;
-		}
-
-		any_nonzero = 0;
-		for (i = 0; i < 0x10; i++) {
-			if (rbuf[i]) {
-				any_nonzero = 1;
-				break;
-			}
-		}
-		if (any_nonzero || subaddr == 0x00) {
-			printk(KERN_INFO "%s:   0x66 sub=0x%02x: %02x %02x %02x %02x  %02x %02x %02x %02x  %02x %02x %02x %02x  %02x %02x %02x %02x\n",
-				dev->name, subaddr,
-				rbuf[0], rbuf[1], rbuf[2], rbuf[3],
-				rbuf[4], rbuf[5], rbuf[6], rbuf[7],
-				rbuf[8], rbuf[9], rbuf[10], rbuf[11],
-				rbuf[12], rbuf[13], rbuf[14], rbuf[15]);
-		}
-
-		if (subaddr >= 0xF0)
-			break;
-	}
-
-	return 0;
 }
 
 /* Write a single register to the LT6911 HDMI receiver via bank-switched I2C.
@@ -904,33 +802,12 @@ int sc0710_lt6911_enable_output(struct sc0710_dev *dev)
 
 int sc0710_i2c_initialize(struct sc0710_dev *dev)
 {
-	u8 subaddr;
-	u8 wbuf[1];
-	u8 rbuf[0x10];
-	int ret, i, any_nonzero;
+	int ret;
 
 	if (dev->board != SC0710_BOARD_ELGATEO_4KP)
 		return 0;
 
-	/* Safe MCU-only register dump at init time.
-	 * DO NOT probe 0x66 (LT6911) — that corrupts the I2C bus.
-	 */
-	printk(KERN_INFO "%s: MCU register map (0x64, sub 0x00-0xFF):\n", dev->name);
-
 	mutex_lock(&dev->signalMutex);
-
-	/* Diagnostic: check all 8 IIC instance states after soft reset */
-	{
-		int iic;
-		printk(KERN_INFO "%s: IIC instance states after card_setup:\n", dev->name);
-		for (iic = 0; iic < 8; iic++) {
-			u32 base = 0x3000 + (iic * 0x200);
-			u32 sr = sc_read(dev, 0, base + 0x104);
-			u32 cr = sc_read(dev, 0, base + 0x100);
-			printk(KERN_INFO "%s:   IIC #%d (base 0x%04x): CR=%08x SR=%08x\n",
-				dev->name, iic, base, cr, sr);
-		}
-	}
 
 	/* Check A8 BEFORE any commands — detect residual state from previous load */
 	{
@@ -952,109 +829,29 @@ int sc0710_i2c_initialize(struct sc0710_dev *dev)
 
 		/* cfg_unknownpart2: send 0x01 to MCU */
 		ret = sc0710_i2c_write(dev, I2C_DEV__ARM_MCU, mcu_cmd_raw, sizeof(mcu_cmd_raw));
-		printk(KERN_INFO "%s: MCU cmd 0x01: ret=%d\n", dev->name, ret);
+		if (ret < 0)
+			printk(KERN_WARNING "%s: MCU init cmd failed: %d\n", dev->name, ret);
 
 		msleep(50);
 
 		/* cfg_unknownpart: send {0x03, 0x12, 0x34, 0x57} to 0x66 */
 		ret = sc0710_i2c_write(dev, I2C_DEV__UNKNOWN, lt_cmd, sizeof(lt_cmd));
-		printk(KERN_INFO "%s: LT6911 init: ret=%d\n", dev->name, ret);
+		if (ret < 0)
+			printk(KERN_WARNING "%s: LT6911 init cmd failed: %d\n", dev->name, ret);
 
 		/* Poll A8 for up to 10 seconds — LT6911 may need time to start output */
 		for (poll = 0; poll < 20; poll++) {
 			msleep(500);
 			a8 = sc_read(dev, 0, 0xa8);
-			if (poll % 4 == 0 || a8 != 0)
-				printk(KERN_INFO "%s: A8 poll %d/%d: %08x\n",
-					dev->name, poll, 20, a8);
-			if (a8 != 0)
-				break;
-		}
-	}
-
-	for (subaddr = 0x00; ; subaddr += 0x10) {
-		wbuf[0] = subaddr;
-		memset(rbuf, 0, sizeof(rbuf));
-
-		ret = __sc0710_i2c_writeread(dev, I2C_DEV__ARM_MCU,
-			wbuf, sizeof(wbuf), rbuf, sizeof(rbuf));
-		if (ret < 0) {
-			printk(KERN_INFO "%s:   sub=0x%02x: ERROR %d\n",
-				dev->name, subaddr, ret);
-			if (subaddr >= 0xF0)
-				break;
-			continue;
-		}
-
-		any_nonzero = 0;
-		for (i = 0; i < 0x10; i++) {
-			if (rbuf[i]) {
-				any_nonzero = 1;
+			if (a8 != 0) {
+				printk(KERN_INFO "%s: A8 active after %dms: %08x\n",
+					dev->name, (poll + 1) * 500, a8);
 				break;
 			}
-		}
-		if (any_nonzero || subaddr == 0x00) {
-			printk(KERN_INFO "%s:   sub=0x%02x: %02x %02x %02x %02x  %02x %02x %02x %02x  %02x %02x %02x %02x  %02x %02x %02x %02x\n",
-				dev->name, subaddr,
-				rbuf[0], rbuf[1], rbuf[2], rbuf[3],
-				rbuf[4], rbuf[5], rbuf[6], rbuf[7],
-				rbuf[8], rbuf[9], rbuf[10], rbuf[11],
-				rbuf[12], rbuf[13], rbuf[14], rbuf[15]);
-		}
-
-		if (subaddr >= 0xF0)
-			break;
-	}
-
-	/* Probe LT6911 at 0x66 — now safe with I2C soft reset applied.
-	 * Read sub-address 0x00 to check if chip responds with real data.
-	 */
-	printk(KERN_INFO "%s: Probing LT6911 (0x66):\n", dev->name);
-	{
-		u8 lt_wbuf[1] = { 0x00 };
-		u8 lt_rbuf[0x10];
-
-		memset(lt_rbuf, 0, sizeof(lt_rbuf));
-		ret = __sc0710_i2c_writeread(dev, I2C_DEV__UNKNOWN,
-			lt_wbuf, sizeof(lt_wbuf), lt_rbuf, sizeof(lt_rbuf));
-		if (ret < 0) {
-			printk(KERN_INFO "%s:   0x66 sub=0x00: ERROR %d\n",
-				dev->name, ret);
-		} else {
-			printk(KERN_INFO "%s:   0x66 sub=0x00: %02x %02x %02x %02x  %02x %02x %02x %02x  %02x %02x %02x %02x  %02x %02x %02x %02x\n",
-				dev->name,
-				lt_rbuf[0], lt_rbuf[1], lt_rbuf[2], lt_rbuf[3],
-				lt_rbuf[4], lt_rbuf[5], lt_rbuf[6], lt_rbuf[7],
-				lt_rbuf[8], lt_rbuf[9], lt_rbuf[10], lt_rbuf[11],
-				lt_rbuf[12], lt_rbuf[13], lt_rbuf[14], lt_rbuf[15]);
-		}
-
-		/* Also try sub-address 0x00 with a small read for chip ID */
-		lt_wbuf[0] = 0x00;
-		memset(lt_rbuf, 0, sizeof(lt_rbuf));
-		ret = __sc0710_i2c_writeread(dev, I2C_DEV__UNKNOWN,
-			lt_wbuf, sizeof(lt_wbuf), lt_rbuf, 4);
-		if (ret == 0) {
-			printk(KERN_INFO "%s:   0x66 chip ID area: %02x %02x %02x %02x\n",
-				dev->name,
-				lt_rbuf[0], lt_rbuf[1], lt_rbuf[2], lt_rbuf[3]);
 		}
 	}
 
 	mutex_unlock(&dev->signalMutex);
-
-	/* Pipeline register dump — compare with Windows values */
-	printk(KERN_INFO "%s: Pipeline regs: 00=%08x 04=%08x 08=%08x\n",
-		dev->name,
-		sc_read(dev, 0, 0x00),
-		sc_read(dev, 0, 0x04),
-		sc_read(dev, 0, 0x08));
-	printk(KERN_INFO "%s: Pipeline regs: A8=%08x AC=%08x D4=%08x E4=%08x\n",
-		dev->name,
-		sc_read(dev, 0, 0xa8),
-		sc_read(dev, 0, 0xac),
-		sc_read(dev, 0, 0xd4),
-		sc_read(dev, 0, 0xe4));
 
 	return 0;
 }

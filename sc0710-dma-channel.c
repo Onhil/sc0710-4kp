@@ -331,35 +331,10 @@ int sc0710_dma_channel_service(struct sc0710_dma_channel *ch)
 	 */
 	v = sc_read(ch->dev, 1, ch->reg_dma_completed_descriptor_count);
 	if (v == ch->dma_completed_descriptor_count_last) {
-		/* Periodic debug: dump DMA status when no progress on ch0 */
-		if (sc0710_debug_mode && ch->nr == 0) {
-			static int stall_count;
-			if (++stall_count % 500 == 1) {
-				u32 s1 = sc_read(ch->dev, 1, ch->reg_dma_status1);
-				u32 ctrl = sc_read(ch->dev, 1, ch->reg_dma_control);
-				u32 sg_cred = sc_read(ch->dev, 1, ch->reg_sg_credits);
-				u32 d0 = sc_read(ch->dev, 0, BAR0_00D0);
-				u32 a8 = sc_read(ch->dev, 0, 0xa8);
-				u32 ac = sc_read(ch->dev, 0, 0xac);
-				u32 c8 = sc_read(ch->dev, 0, BAR0_00C8);
-				u32 d8 = sc_read(ch->dev, 0, BAR0_00D8);
-				u32 dc = sc_read(ch->dev, 0, BAR0_00DC);
-				u32 e4 = sc_read(ch->dev, 0, 0xe4);
-				u32 sg_l = sc_read(ch->dev, 1, ch->reg_sg_start_l);
-				u32 sg_h = sc_read(ch->dev, 1, ch->reg_sg_start_h);
-				printk(KERN_INFO "%s: ch#%d STALL desc=%d s1=%08x ctrl=%08x sgcred=%08x\n",
-					ch->dev->name, ch->nr, v, s1, ctrl, sg_cred);
-				printk(KERN_INFO "%s:   BAR0: A8=%08x AC=%08x C8=%08x D0=%08x D8=%08x DC=%08x E4=%08x\n",
-					ch->dev->name, a8, ac, c8, d0, d8, dc, e4);
-				printk(KERN_INFO "%s:   SG start=%08x:%08x pt_dma=%llx\n",
-					ch->dev->name, sg_h, sg_l, ch->pt_dma);
-			}
-		}
 		/* No new buffers since our last service call. */
 		mutex_unlock(&ch->lock);
 		return 0;
 	}
-
 	dprintk(3, "ch#%d    was %d now %d\n", ch->nr, ch->dma_completed_descriptor_count_last, v);
 	ch->dma_completed_descriptor_count_last = v;
 
@@ -742,15 +717,6 @@ int sc0710_dma_channel_start(struct sc0710_dma_channel *ch)
 	if (ch->state == STATE_RUNNING)
 		return 0;
 
-	if (sc0710_debug_mode) {
-		u32 sg_id = sc_read(ch->dev, 1, ch->register_sg_base);
-		u32 s1 = sc_read(ch->dev, 1, ch->reg_dma_status1);
-		printk(KERN_INFO "%s: ch#%d PRE-START: sg_id=%08x s1=%08x sg_base=0x%04x sg_cred_reg=0x%04x total_desc=%d\n",
-			ch->dev->name, ch->nr, sg_id, s1,
-			ch->register_sg_base, ch->reg_sg_credits,
-			ch->sg_total_descriptors);
-	}
-
 	sc_write(ch->dev, 1, ch->reg_dma_control_w1s, 0x00000001);
 
 	/* Write SG credits after run bit is set.
@@ -758,27 +724,6 @@ int sc0710_dma_channel_start(struct sc0710_dma_channel *ch)
 	 * before credits are accepted.
 	 */
 	sc_write(ch->dev, 1, ch->reg_sg_credits, ch->sg_total_descriptors);
-
-	if (sc0710_debug_mode) {
-		u32 cred_readback, s1, ctrl, desc;
-
-		cred_readback = sc_read(ch->dev, 1, ch->reg_sg_credits);
-		s1 = sc_read(ch->dev, 1, ch->reg_dma_status1);
-		ctrl = sc_read(ch->dev, 1, ch->reg_dma_control);
-		desc = sc_read(ch->dev, 1, ch->reg_dma_completed_descriptor_count);
-		printk(KERN_INFO "%s: ch#%d POST-CREDIT: cred=%08x s1=%08x ctrl=%08x desc=%d\n",
-			ch->dev->name, ch->nr, cred_readback, s1, ctrl, desc);
-
-		/* Check engine state after delay — differentiates between
-		 * stuck-on-fetch (BUSY) vs waiting-for-stream-data (BUSY)
-		 * vs completed transfers (DESCRIPTOR_COMPLETED).
-		 */
-		msleep(100);
-		s1 = sc_read(ch->dev, 1, ch->reg_dma_status1);
-		desc = sc_read(ch->dev, 1, ch->reg_dma_completed_descriptor_count);
-		printk(KERN_INFO "%s: ch#%d AFTER-100ms: s1=%08x desc=%d\n",
-			ch->dev->name, ch->nr, s1, desc);
-	}
 
 	ch->state = STATE_RUNNING;
 	return 0;
