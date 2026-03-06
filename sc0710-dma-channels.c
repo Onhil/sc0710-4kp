@@ -125,9 +125,11 @@ int sc0710_dma_channels_start(struct sc0710_dev *dev)
 	 */
 	sc_set(dev, 0, BAR0_00D0, 0x0001);
 
-	/* Enable scaler-to-DMA data path (4KP only). */
+	/* Enable scaler-to-DMA data path (4KP only).
+	 * Windows driver uses bit 0x20 when signal is active.
+	 */
 	if (dev->board == SC0710_BOARD_ELGATEO_4KP)
-		sc_write(dev, 0, 0xEC, 0x00000001);
+		sc_write(dev, 0, 0xEC, 0x00000021);
 
 	if (dev->board == SC0710_BOARD_ELGATEO_4KP) {
 		int poll;

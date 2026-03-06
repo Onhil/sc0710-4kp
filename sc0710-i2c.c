@@ -217,6 +217,78 @@ static int __sc0710_i2c_writeread(struct sc0710_dev *dev, u8 devaddr8bit, u8 *wb
 	return 0; /* Success */
 }
 
+/*
+ * Multi-byte write then read with repeated start.
+ * Unlike __sc0710_i2c_writeread which only sends wbuf[0] as sub-address,
+ * this sends ALL wlen bytes before the repeated start + read.
+ * Used for the proxy device (0xAA) which needs multi-byte command headers.
+ */
+static int __sc0710_i2c_writeread_multi(struct sc0710_dev *dev, u8 devaddr8bit,
+	u8 *wbuf, int wlen, u8 *rbuf, int rlen)
+{
+	u32 v;
+	int i, cnt;
+	unsigned long timeout = jiffies + msecs_to_jiffies(500);
+
+	/* TX FIFO reset + enable */
+	sc_write(dev, 0, BAR0_3100, 0x00000002);
+	sc_write(dev, 0, BAR0_3100, 0x00000001);
+
+	/* START + device address (write) */
+	sc_write(dev, 0, BAR0_3108, (1 << 8) | devaddr8bit);
+
+	/* Wait for device ACK — lenient, continue even if no expected status */
+	cnt = 16;
+	while (cnt-- > 0) {
+		if (time_after(jiffies, timeout))
+			return -ETIMEDOUT;
+		v = sc_read(dev, 0, BAR0_3104);
+		if ((v == 0x44) || (v == 0x40) || (v & 0x80) || (v & 0x04))
+			break;
+		udelay(64);
+	}
+	printk(KERN_DEBUG "writeread_multi: dev ACK status=%08x cnt=%d\n", v, cnt);
+	/* Continue even if ACK check timed out (4KP quirk) */
+
+	/* Write all data bytes (no STOP bit — we want repeated start) */
+	for (i = 0; i < wlen; i++) {
+		sc_write(dev, 0, BAR0_3108, wbuf[i]);
+		cnt = 16;
+		while (cnt-- > 0) {
+			if (time_after(jiffies, timeout))
+				return -ETIMEDOUT;
+			v = sc_read(dev, 0, BAR0_3104);
+			if (v & 0x80) /* TX FIFO empty — byte consumed */
+				break;
+			udelay(64);
+		}
+		printk(KERN_DEBUG "writeread_multi: byte[%d]=0x%02x status=%08x cnt=%d\n",
+			i, wbuf[i], v, cnt);
+		/* Continue even if byte wasn't consumed */
+	}
+
+	/* Repeated start + read */
+	msleep(1);
+	sc_write(dev, 0, BAR0_3120, 0x0000000f);
+	sc_write(dev, 0, BAR0_3100, 0x00000002); /* TX FIFO reset */
+	sc_write(dev, 0, BAR0_3100, 0x00000000);
+	sc_write(dev, 0, BAR0_3108, (1 << 8) | (devaddr8bit | 1)); /* START + read addr */
+	sc_write(dev, 0, BAR0_3108, (1 << 9) | rlen); /* STOP + read count */
+	sc_write(dev, 0, BAR0_3100, 0x00000001); /* Enable */
+
+	/* Read reply bytes */
+	for (i = 0; i < rlen; i++) {
+		rbuf[i] = busread(dev);
+	}
+
+	v = sc_read(dev, 0, BAR0_3104);
+	printk(KERN_DEBUG "writeread_multi: completion status=%08x\n", v);
+	if (v != 0xc8 && v != 0xcc && v != 0xc0 && v != 0x80)
+		return -EIO;
+
+	return 0;
+}
+
 static int sc0710_i2c_writeread(struct sc0710_dev *dev, u8 devaddr8bit, u8 *wbuf, int wlen, u8 *rbuf, int rlen)
 {
 	int ret;
@@ -715,87 +787,122 @@ int sc0710_i2c_read_procamp(struct sc0710_dev *dev)
  *
  * Caller must hold signalMutex.
  */
+/* Factory EDID base block bytes 0x00-0x5F.
+ * These bytes are volatile and lost on cold boot (read as 0xFF).
+ * Bytes 0x60-0xFF persist across power cycles.
+ * The Windows driver writes these on every load.
+ */
+static const u8 factory_edid_base[96] = {
+	/* 00 */ 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00,
+	/* 08 */ 0x14, 0xE1, 0x12, 0x00, 0x06, 0x00, 0x00, 0x00,
+	/* 10 */ 0x2F, 0x21, 0x01, 0x03, 0x80, 0x80, 0x48, 0x78,
+	/* 18 */ 0x2A, 0xDA, 0xFF, 0xA3, 0x58, 0x4A, 0xA2, 0x29,
+	/* 20 */ 0x17, 0x49, 0x4B, 0x20, 0x08, 0x00, 0x31, 0x40,
+	/* 28 */ 0x61, 0x40, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+	/* 30 */ 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x08, 0xE8,
+	/* 38 */ 0x00, 0x30, 0xF2, 0x70, 0x5A, 0x80, 0xB0, 0x58,
+	/* 40 */ 0x8A, 0x00, 0xBA, 0x88, 0x21, 0x00, 0x00, 0x1E,
+	/* 48 */ 0x02, 0x3A, 0x80, 0x18, 0x71, 0x38, 0x2D, 0x40,
+	/* 50 */ 0x58, 0x2C, 0x45, 0x00, 0xBA, 0x88, 0x21, 0x00,
+	/* 58 */ 0x00, 0x1E, 0x6F, 0xC2, 0x00, 0xA0, 0xA0, 0xA0,
+};
+
+static void sc0710_write_factory_edid(struct sc0710_dev *dev)
+{
+	#define I2C_EDID_EEPROM (0x50 << 1)
+	u8 w[1] = { 0x00 };
+	u8 r[8] = { 0 };
+	int i, ret;
+
+	__sc0710_i2c_writeread(dev, I2C_EDID_EEPROM, w, sizeof(w), r, sizeof(r));
+
+	if (r[0] != 0x00 || r[1] != 0xFF) {
+		printk(KERN_INFO "%s: EDID header invalid (%02x %02x), writing factory data\n",
+			dev->name, r[0], r[1]);
+
+		for (i = 0; i < 96; i += 8) {
+			u8 wr[10];
+			int j;
+			wr[0] = 0x00;
+			wr[1] = i;
+			for (j = 0; j < 8; j++)
+				wr[j + 2] = factory_edid_base[i + j];
+			ret = sc0710_i2c_write(dev, I2C_EDID_EEPROM, wr, 10);
+			if (ret < 0)
+				break;
+			msleep(10);
+		}
+	}
+}
+
 int sc0710_lt6911_enable_output(struct sc0710_dev *dev)
 {
 	u32 a8;
-	int ret;
-
-	/* cfg_unknownpart2: write 0x01 to MCU (0x64).
-	 * wbuf[0]=dummy, wbuf[1]=0x01 sent on wire.
-	 */
-	u8 mcu_cmd[2] = { 0x10, 0x01 };
-	ret = sc0710_i2c_write(dev, I2C_DEV__ARM_MCU, mcu_cmd, sizeof(mcu_cmd));
-	if (ret < 0)
-		printk(KERN_WARNING "%s: MCU init cmd failed: %d\n", dev->name, ret);
-
-	msleep(50);
-
-	/* cfg_unknownpart: write {0x03, 0x12, 0x34, 0x57} to LT6911 proxy (0x66).
-	 * wbuf[0]=dummy, wbuf[1..4] sent on wire as sub=0x03 data=0x12,0x34,0x57.
-	 */
-	u8 lt_cmd[5] = { 0xAB, 0x03, 0x12, 0x34, 0x57 };
-	ret = sc0710_i2c_write(dev, I2C_DEV__UNKNOWN, lt_cmd, sizeof(lt_cmd));
-	if (ret < 0)
-		printk(KERN_WARNING "%s: LT6911 init cmd failed: %d\n", dev->name, ret);
-
-	msleep(200);
+	int i;
+	u8 wbuf[1] = { 0x00 };
+	u8 rbuf[16];
 
 	a8 = sc_read(dev, 0, 0xa8);
-	printk(KERN_INFO "%s: Pipeline after init cmds: A8=%08x\n", dev->name, a8);
+	if (a8 != 0) {
+		printk(KERN_INFO "%s: A8 already active (%08x), TX ok\n", dev->name, a8);
+		return 0;
+	}
 
+	/* MCU TX status for diagnostics */
+	wbuf[0] = 0x10;
+	__sc0710_i2c_writeread(dev, I2C_DEV__ARM_MCU, wbuf, 1, rbuf, 16);
+	printk(KERN_INFO "%s: MCU TX status [13-15]: %02x %02x %02x (0x80=disabled)\n",
+		dev->name, rbuf[3], rbuf[4], rbuf[5]);
+
+	/* Pipeline registers are set early in card_setup().
+	 * Poll A8 — LT6911 TX may need time after pipeline enable.
+	 */
+	for (i = 0; i < 10; i++) {
+		msleep(500);
+		a8 = sc_read(dev, 0, 0xa8);
+		if (a8 != 0) {
+			printk(KERN_INFO "%s: A8 active after %dms: %08x\n",
+				dev->name, (i + 1) * 500, a8);
+			return 0;
+		}
+	}
+
+	printk(KERN_INFO "%s: A8 still 0 after 5s — LT6911 TX not outputting\n", dev->name);
 	return 0;
 }
 
 int sc0710_i2c_initialize(struct sc0710_dev *dev)
 {
 	int ret;
+	u8 subaddr;
+	u8 wbuf[1];
+	u8 rbuf[0x10];
 
 	if (dev->board != SC0710_BOARD_ELGATEO_4KP)
 		return 0;
 
-	mutex_lock(&dev->signalMutex);
-
-	/* Check A8 BEFORE any commands — detect residual state from previous load */
-	{
-		u32 a8_pre = sc_read(dev, 0, 0xa8);
-		printk(KERN_INFO "%s: A8 pre-init (residual): %08x\n", dev->name, a8_pre);
-	}
-
-	/* Wait for MCU to be ready after PCI enumeration */
 	msleep(500);
 
-	/* Send init commands to MCU and LT6911 proxy.
-	 * sc0710_i2c_write() skips wbuf[0], so wbuf[0] is a dummy byte.
-	 */
-	{
-		u8 mcu_cmd_raw[2] = { 0x00, 0x01 };
-		u8 lt_cmd[5] = { 0x00, 0x03, 0x12, 0x34, 0x57 };
-		int poll;
-		u32 a8;
+	mutex_lock(&dev->signalMutex);
 
-		/* cfg_unknownpart2: send 0x01 to MCU */
-		ret = sc0710_i2c_write(dev, I2C_DEV__ARM_MCU, mcu_cmd_raw, sizeof(mcu_cmd_raw));
-		if (ret < 0)
-			printk(KERN_WARNING "%s: MCU init cmd failed: %d\n", dev->name, ret);
-
-		msleep(50);
-
-		/* cfg_unknownpart: send {0x03, 0x12, 0x34, 0x57} to 0x66 */
-		ret = sc0710_i2c_write(dev, I2C_DEV__UNKNOWN, lt_cmd, sizeof(lt_cmd));
-		if (ret < 0)
-			printk(KERN_WARNING "%s: LT6911 init cmd failed: %d\n", dev->name, ret);
-
-		/* Poll A8 for up to 10 seconds — LT6911 may need time to start output */
-		for (poll = 0; poll < 20; poll++) {
-			msleep(500);
-			a8 = sc_read(dev, 0, 0xa8);
-			if (a8 != 0) {
-				printk(KERN_INFO "%s: A8 active after %dms: %08x\n",
-					dev->name, (poll + 1) * 500, a8);
-				break;
-			}
-		}
+	/* MCU initial state */
+	printk(KERN_INFO "%s: === MCU INITIAL STATE ===\n", dev->name);
+	for (subaddr = 0x00; subaddr <= 0x10; subaddr += 0x10) {
+		wbuf[0] = subaddr;
+		memset(rbuf, 0, sizeof(rbuf));
+		ret = __sc0710_i2c_writeread(dev, I2C_DEV__ARM_MCU,
+			wbuf, sizeof(wbuf), rbuf, sizeof(rbuf));
+		if (ret >= 0)
+			printk(KERN_INFO "%s:   [%02x]: %02x %02x %02x %02x  %02x %02x %02x %02x  %02x %02x %02x %02x  %02x %02x %02x %02x\n",
+				dev->name, subaddr,
+				rbuf[0], rbuf[1], rbuf[2], rbuf[3],
+				rbuf[4], rbuf[5], rbuf[6], rbuf[7],
+				rbuf[8], rbuf[9], rbuf[10], rbuf[11],
+				rbuf[12], rbuf[13], rbuf[14], rbuf[15]);
 	}
+
+	/* Write factory EDID if missing (lost on cold boot) */
+	sc0710_write_factory_edid(dev);
 
 	mutex_unlock(&dev->signalMutex);
 
