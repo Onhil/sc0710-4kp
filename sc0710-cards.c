@@ -106,7 +106,6 @@ void sc0710_gpio_setup(struct sc0710_dev *dev)
 #define ECP5_LSC_BITSTREAM_BURST 0x7A
 #define ECP5_LSC_READ_STATUS   0x3C
 #define ECP5_LSC_REFRESH       0x79
-#define ECP5_USERCODE          0xC0
 
 /* Firmware file constants */
 #define FWI_HEADER_SIZE  16
@@ -263,15 +262,6 @@ static int ecp5_read_status(struct sc0710_dev *dev, u32 *status)
 	return 0;
 }
 
-static u32 ecp5_read_usercode(struct sc0710_dev *dev)
-{
-	u8 tx[8] = { ECP5_USERCODE, 0, 0, 0, 0, 0, 0, 0 };
-	u8 rx[4] = { 0 };
-
-	ecp5_spi_xfer(dev, tx, 8, rx, 4);
-	return (rx[0] << 24) | (rx[1] << 16) | (rx[2] << 8) | rx[3];
-}
-
 /* Program the Lattice ECP5 with a raw bitstream via ISC commands */
 static int ecp5_program_bitstream(struct sc0710_dev *dev, const u8 *data, u32 len)
 {
@@ -279,95 +269,66 @@ static int ecp5_program_bitstream(struct sc0710_dev *dev, const u8 *data, u32 le
 	u32 status;
 	int ret;
 
-	printk(KERN_INFO "%s: Programming ECP5 (%u bytes)...\n", dev->name, len);
-
-	/* SPI reset at start of programming sequence */
 	ecp5_spi_reset(dev);
 
-	/* Check if ECP5 is responsive. If SPI returns all FFs (e.g. after
-	 * a failed programming attempt), send REFRESH to reset the device
-	 * back to factory firmware so it responds to ISC commands.
-	 * Windows doesn't need this because it always starts from clean state.
+	/* If ECP5 is unresponsive (e.g. after failed programming),
+	 * send REFRESH to reset back to factory firmware.
 	 */
-	{
-		u32 id = ecp5_read_idcode(dev);
-		if (id == 0xFFFFFFFF) {
-			printk(KERN_INFO "%s: ECP5 SPI unresponsive, sending REFRESH\n",
-				dev->name);
-			cmd[0] = ECP5_LSC_REFRESH;
-			cmd[1] = 0x00;
-			cmd[2] = 0x00;
-			cmd[3] = 0x00;
-			ecp5_spi_xfer(dev, cmd, 4, NULL, 0);
-			msleep(200);
-			ecp5_spi_reset(dev);
-		}
+	if (ecp5_read_idcode(dev) == 0xFFFFFFFF) {
+		printk(KERN_WARNING "%s: ECP5 unresponsive, sending REFRESH\n",
+			dev->name);
+		cmd[0] = ECP5_LSC_REFRESH;
+		cmd[1] = 0x00;
+		cmd[2] = 0x00;
+		cmd[3] = 0x00;
+		ecp5_spi_xfer(dev, cmd, 4, NULL, 0);
+		msleep(200);
+		ecp5_spi_reset(dev);
 	}
 
-	/* 1. ISC_ENABLE — operand 0x00 for normal SRAM programming.
-	 * Note: 0x08 is "transparent" mode (MachXO2), NOT correct for ECP5.
-	 */
+	/* ISC_ENABLE */
 	cmd[0] = ECP5_ISC_ENABLE;
 	cmd[1] = 0x00;
 	cmd[2] = 0x00;
 	cmd[3] = 0x00;
 	ecp5_spi_xfer(dev, cmd, 4, NULL, 0);
 	msleep(1);
-
 	ret = ecp5_check_busy(dev, 100);
 	if (ret) {
-		ecp5_read_status(dev, &status);
-		printk(KERN_ERR "%s: ECP5 busy after ISC_ENABLE (status: %08x)\n",
-			dev->name, status);
+		printk(KERN_ERR "%s: ECP5 ISC_ENABLE failed\n", dev->name);
 		return ret;
 	}
 
-	ecp5_read_status(dev, &status);
-	printk(KERN_INFO "%s: ECP5 status after ISC_ENABLE: %08x\n", dev->name, status);
-
-	/* 2. ISC_ERASE — erase SRAM configuration */
+	/* ISC_ERASE — erase SRAM */
 	cmd[0] = ECP5_ISC_ERASE;
-	cmd[1] = 0x01; /* erase SRAM */
+	cmd[1] = 0x01;
 	cmd[2] = 0x00;
 	cmd[3] = 0x00;
 	ecp5_spi_xfer(dev, cmd, 4, NULL, 0);
-
-	/* Erase can take up to 5 seconds */
 	ret = ecp5_check_busy(dev, 5000);
 	if (ret) {
-		ecp5_read_status(dev, &status);
-		printk(KERN_ERR "%s: ECP5 busy after ISC_ERASE (status: %08x)\n",
-			dev->name, status);
+		printk(KERN_ERR "%s: ECP5 ISC_ERASE failed\n", dev->name);
 		return ret;
 	}
 
-	ecp5_read_status(dev, &status);
-	printk(KERN_INFO "%s: ECP5 status after erase: %08x\n", dev->name, status);
-
-	/* 3. LSC_INIT_ADDRESS — reset frame address */
+	/* LSC_INIT_ADDRESS */
 	cmd[0] = ECP5_LSC_INIT_ADDRESS;
-	cmd[1] = 0x01;
+	cmd[1] = 0x00;
 	cmd[2] = 0x00;
 	cmd[3] = 0x00;
 	ecp5_spi_xfer(dev, cmd, 4, NULL, 0);
 	msleep(1);
 
-	/* 4. LSC_BITSTREAM_BURST — command + all data in ONE CS cycle.
-	 * Windows sends everything in a single CS assertion: command (4 bytes)
-	 * + data (356,448 bytes), byte-by-byte with SPISR polling.
-	 */
+	/* BITSTREAM_BURST — command + data in one CS cycle */
 	ecp5_spi_burst_write(dev, data, len);
 
-	/* Match Windows post-burst sequence exactly:
-	 * ISC_DISABLE → NOP → READ_STATUS (no delays between)
-	 */
+	/* ISC_DISABLE + NOP + STATUS (matching Windows sequence) */
 	cmd[0] = ECP5_ISC_DISABLE;
 	cmd[1] = 0x00;
 	cmd[2] = 0x00;
 	cmd[3] = 0x00;
 	ecp5_spi_xfer(dev, cmd, 4, NULL, 0);
 
-	/* NOP (0xFF) — Windows sends this between ISC_DISABLE and status read */
 	cmd[0] = 0xFF;
 	cmd[1] = 0xFF;
 	cmd[2] = 0xFF;
@@ -375,13 +336,12 @@ static int ecp5_program_bitstream(struct sc0710_dev *dev, const u8 *data, u32 le
 	ecp5_spi_xfer(dev, cmd, 4, NULL, 0);
 
 	ecp5_read_status(dev, &status);
-	printk(KERN_INFO "%s: ECP5 status after programming: %08x (DONE=%d)\n",
-		dev->name, status, (status >> 8) & 1);
-
-	if (!(status & 0x100) && status != 0xFFFFFFFF) {
-		printk(KERN_ERR "%s: ECP5 DONE not set after programming\n", dev->name);
+	if (!(status & 0x100)) {
+		printk(KERN_ERR "%s: ECP5 programming failed (status: %08x)\n",
+			dev->name, status);
 		return -EIO;
 	}
+	printk(KERN_INFO "%s: ECP5 firmware programmed successfully\n", dev->name);
 
 	return 0;
 }
@@ -390,37 +350,24 @@ static int ecp5_program_bitstream(struct sc0710_dev *dev, const u8 *data, u32 le
 static int sc0710_ecp5_firmware_check(struct sc0710_dev *dev)
 {
 	const struct firmware *fw;
-	u32 idcode, half_size, status, usercode;
+	u32 idcode, half_size, status;
 	u8 *decoded;
 	int ret, i;
 
-	/* Probe: try JEDEC SPI flash ID (0x9F) to check if SPI is
-	 * connected to a flash chip or the ECP5 SSPI port.
-	 */
-	{
-		u8 jtx[4] = { 0x9F, 0x00, 0x00, 0x00 };
-		u8 jrx[3] = { 0 };
-		ecp5_spi_reset(dev);
-		ecp5_spi_xfer(dev, jtx, 4, jrx, 3);
-		printk(KERN_INFO "%s: SPI JEDEC probe: %02x %02x %02x\n",
-			dev->name, jrx[0], jrx[1], jrx[2]);
-	}
-
+	ecp5_spi_reset(dev);
 	idcode = ecp5_read_idcode(dev);
 	ecp5_read_status(dev, &status);
-	usercode = ecp5_read_usercode(dev);
-	printk(KERN_INFO "%s: ECP5 IDCODE: %08x, status: %08x (DONE=%d), USERCODE: %08x\n",
-		dev->name, idcode, status, (status >> 8) & 1, usercode);
+	printk(KERN_INFO "%s: ECP5 IDCODE: %08x, status: %08x (DONE=%d)\n",
+		dev->name, idcode, status, (status >> 8) & 1);
 
-	/* If DONE=1, the ECP5 is already configured (e.g. warm reboot from Windows).
-	 * TODO: restore skip once cold boot programming verified.
-	 */
-	if (status & 0x100)
-		printk(KERN_INFO "%s: ECP5 DONE=1, re-programming for testing\n",
+	/* If DONE=1, the ECP5 is already configured (e.g. warm reboot) */
+	if (status & 0x100) {
+		printk(KERN_INFO "%s: ECP5 already configured, skipping firmware upload\n",
 			dev->name);
+		return 0;
+	}
 
-	printk(KERN_INFO "%s: Programming ECP5 — uploading SC0710.FWI.HEX\n",
-		dev->name);
+	printk(KERN_INFO "%s: Programming ECP5 firmware\n", dev->name);
 
 	ret = request_firmware(&fw, "sc0710/SC0710.FWI.HEX", &dev->pci->dev);
 	if (ret) {
@@ -461,36 +408,12 @@ static int sc0710_ecp5_firmware_check(struct sc0710_dev *dev)
 
 	release_firmware(fw);
 
-	printk(KERN_INFO "%s: Bitstream: %u bytes, starts: %*ph\n",
-		dev->name, half_size * 2, 16, decoded);
-
 	ret = ecp5_program_bitstream(dev, decoded, half_size * 2);
 	vfree(decoded);
 
-	if (ret == 0) {
-		u32 a8;
-		int tries;
-
-		printk(KERN_INFO "%s: ECP5 firmware upload complete, waiting for pipeline\n",
-			dev->name);
-
-		/* Wait for A8 to become non-zero — indicates the ECP5 design
-		 * is running and the LT6911 TX→FPGA path is active.
-		 * This can take several hundred ms after programming.
-		 */
-		for (tries = 0; tries < 50; tries++) {
-			msleep(100);
-			a8 = sc_read(dev, 0, 0x00A8);
-			if (a8) {
-				printk(KERN_INFO "%s: ECP5 pipeline active, A8=%08x (after %dms)\n",
-					dev->name, a8, (tries + 1) * 100);
-				break;
-			}
-		}
-		if (!a8)
-			printk(KERN_WARNING "%s: ECP5 pipeline not active after 5s (A8=0)\n",
-				dev->name);
-	}
+	if (ret)
+		printk(KERN_ERR "%s: ECP5 firmware upload failed: %d\n",
+			dev->name, ret);
 
 	return ret;
 }
@@ -618,31 +541,16 @@ void sc0710_card_setup(struct sc0710_dev *dev)
 		sc_write(dev, 1, BAR1_20A0, 0);
 		sc_write(dev, 1, BAR1_20A4, 0);
 
-		/* 4KP: Configure FPGA pipeline early.
-		 * Windows driver sets EC bits 0x10 (no signal) or 0x20 (active signal),
-		 * NOT bit 0x01 as we previously assumed.
-		 * Test: use Windows-style EC values.
-		 */
+		/* 4KP: Configure FPGA pipeline early (values from Windows trace) */
 		if (dev->board == SC0710_BOARD_ELGATEO_4KP) {
-			u32 ec_before = sc_read(dev, 0, 0xEC);
-
 			sc_write(dev, 0, BAR0_00C8, 0x0870);  /* input height: 2160 */
 			sc_write(dev, 0, BAR0_00D8, 0x0438);  /* scaler output: 1080 */
-			sc_write(dev, 0, BAR0_00D0, 0x4100);  /* pipeline config */
+			sc_write(dev, 0, BAR0_00D0, 0x4100);
 			sc_write(dev, 0, 0xCC, 0x00000000);
 			sc_write(dev, 0, BAR0_00D0, 0x4300);  /* reset */
 			sc_write(dev, 0, BAR0_00D0, 0x4100);
 			sc_set(dev, 0, BAR0_00D0, 0x0001);    /* pipeline enable */
-
-			/* Try Windows-style EC: bit 0x10 first (no-signal state),
-			 * then bit 0x20 (active signal state).
-			 */
-			sc_write(dev, 0, 0xEC, 0x00000010);
-			printk(KERN_INFO "%s: Early pipeline: EC before=%08x, now D0=%08x EC=%08x A8=%08x\n",
-				dev->name, ec_before,
-				sc_read(dev, 0, BAR0_00D0),
-				sc_read(dev, 0, 0xEC),
-				sc_read(dev, 0, 0xa8));
+			sc_write(dev, 0, 0xEC, 0x00000020);   /* scaler enable */
 		}
 		break;
 	}
