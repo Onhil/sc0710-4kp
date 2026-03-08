@@ -873,33 +873,12 @@ int sc0710_lt6911_enable_output(struct sc0710_dev *dev)
 
 int sc0710_i2c_initialize(struct sc0710_dev *dev)
 {
-	int ret;
-	u8 subaddr;
-	u8 wbuf[1];
-	u8 rbuf[0x10];
-
 	if (dev->board != SC0710_BOARD_ELGATEO_4KP)
 		return 0;
 
 	msleep(500);
 
 	mutex_lock(&dev->signalMutex);
-
-	/* MCU initial state */
-	printk(KERN_INFO "%s: === MCU INITIAL STATE ===\n", dev->name);
-	for (subaddr = 0x00; subaddr <= 0x10; subaddr += 0x10) {
-		wbuf[0] = subaddr;
-		memset(rbuf, 0, sizeof(rbuf));
-		ret = __sc0710_i2c_writeread(dev, I2C_DEV__ARM_MCU,
-			wbuf, sizeof(wbuf), rbuf, sizeof(rbuf));
-		if (ret >= 0)
-			printk(KERN_INFO "%s:   [%02x]: %02x %02x %02x %02x  %02x %02x %02x %02x  %02x %02x %02x %02x  %02x %02x %02x %02x\n",
-				dev->name, subaddr,
-				rbuf[0], rbuf[1], rbuf[2], rbuf[3],
-				rbuf[4], rbuf[5], rbuf[6], rbuf[7],
-				rbuf[8], rbuf[9], rbuf[10], rbuf[11],
-				rbuf[12], rbuf[13], rbuf[14], rbuf[15]);
-	}
 
 	/* Write factory EDID if missing (lost on cold boot) */
 	sc0710_write_factory_edid(dev);
