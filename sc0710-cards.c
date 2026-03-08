@@ -106,6 +106,7 @@ void sc0710_gpio_setup(struct sc0710_dev *dev)
 #define ECP5_LSC_BITSTREAM_BURST 0x7A
 #define ECP5_LSC_READ_STATUS   0x3C
 #define ECP5_LSC_REFRESH       0x79
+#define ECP5_USERCODE          0xC0
 
 /* Firmware file constants */
 #define FWI_HEADER_SIZE  16
@@ -176,6 +177,56 @@ static int ecp5_spi_xfer(struct sc0710_dev *dev, const u8 *tx, int tx_len,
 	return 0;
 }
 
+/* Send BITSTREAM_BURST command + data in ONE CS cycle, matching Windows.
+ * Protocol per byte: write DTR → poll SPISR (TX empty) → read DRR (drain RX).
+ */
+static void ecp5_spi_burst_write(struct sc0710_dev *dev, const u8 *data, u32 len)
+{
+	u32 i;
+
+	/* Reset FIFOs, assert CS, enable master */
+	sc_write(dev, 0, SPI_CR, 0x1E6);
+	sc_write(dev, 0, SPI_SSR, 0xFFFFFFFE);
+	sc_write(dev, 0, SPI_CR, 0x86);
+
+	/* Send command: 7A 00 00 00 */
+	sc_write(dev, 0, SPI_DTR, ECP5_LSC_BITSTREAM_BURST);
+	while (!(sc_read(dev, 0, SPI_SR) & 0x04))
+		;
+	sc_read(dev, 0, SPI_DRR);
+
+	sc_write(dev, 0, SPI_DTR, 0x00);
+	while (!(sc_read(dev, 0, SPI_SR) & 0x04))
+		;
+	sc_read(dev, 0, SPI_DRR);
+
+	sc_write(dev, 0, SPI_DTR, 0x00);
+	while (!(sc_read(dev, 0, SPI_SR) & 0x04))
+		;
+	sc_read(dev, 0, SPI_DRR);
+
+	sc_write(dev, 0, SPI_DTR, 0x00);
+	while (!(sc_read(dev, 0, SPI_SR) & 0x04))
+		;
+	sc_read(dev, 0, SPI_DRR);
+
+	/* Send data bytes */
+	for (i = 0; i < len; i++) {
+		sc_write(dev, 0, SPI_DTR, data[i]);
+		while (!(sc_read(dev, 0, SPI_SR) & 0x04))
+			;
+		sc_read(dev, 0, SPI_DRR);
+
+		if ((i & 0x7FFF) == 0 && i > 0)
+			printk(KERN_INFO "%s: ECP5 programming %u/%u bytes\n",
+				dev->name, i, len);
+	}
+
+	/* Inhibit master, deassert CS */
+	sc_write(dev, 0, SPI_CR, 0x186);
+	sc_write(dev, 0, SPI_SSR, 0xFFFFFFFF);
+}
+
 static u32 ecp5_read_idcode(struct sc0710_dev *dev)
 {
 	u8 tx[8] = { ECP5_READ_ID, 0, 0, 0, 0, 0, 0, 0 };
@@ -188,14 +239,14 @@ static u32 ecp5_read_idcode(struct sc0710_dev *dev)
 
 static int ecp5_check_busy(struct sc0710_dev *dev, int timeout_ms)
 {
-	/* ECP5 SPI: 1 command byte + 3 padding bytes; busy flag in last byte bit 7 */
+	/* ECP5 SPI: 1 command byte + 3 padding bytes; busy if response byte != 0 */
 	u8 tx[4] = { ECP5_LSC_CHECK_BUSY, 0, 0, 0 };
 	u8 rx[1];
 	int i;
 
 	for (i = 0; i < timeout_ms; i++) {
 		ecp5_spi_xfer(dev, tx, 4, rx, 1);
-		if (!(rx[0] & 0x80))
+		if (!rx[0])
 			return 0;
 		msleep(1);
 	}
@@ -212,35 +263,52 @@ static int ecp5_read_status(struct sc0710_dev *dev, u32 *status)
 	return 0;
 }
 
+static u32 ecp5_read_usercode(struct sc0710_dev *dev)
+{
+	u8 tx[8] = { ECP5_USERCODE, 0, 0, 0, 0, 0, 0, 0 };
+	u8 rx[4] = { 0 };
+
+	ecp5_spi_xfer(dev, tx, 8, rx, 4);
+	return (rx[0] << 24) | (rx[1] << 16) | (rx[2] << 8) | rx[3];
+}
+
 /* Program the Lattice ECP5 with a raw bitstream via ISC commands */
 static int ecp5_program_bitstream(struct sc0710_dev *dev, const u8 *data, u32 len)
 {
 	u8 cmd[4];
 	u32 status;
-	int ret, i, offset;
+	int ret;
 
 	printk(KERN_INFO "%s: Programming ECP5 (%u bytes)...\n", dev->name, len);
 
-	/* Single SPI reset at start of programming sequence */
+	/* SPI reset at start of programming sequence */
 	ecp5_spi_reset(dev);
 
-	/* 0. LSC_REFRESH — reset ECP5 to configuration mode.
-	 * If the ECP5 booted from external SPI flash and is running a
-	 * user design, it won't accept ISC_ENABLE until reset.
+	/* Check if ECP5 is responsive. If SPI returns all FFs (e.g. after
+	 * a failed programming attempt), send REFRESH to reset the device
+	 * back to factory firmware so it responds to ISC commands.
+	 * Windows doesn't need this because it always starts from clean state.
 	 */
-	cmd[0] = ECP5_LSC_REFRESH;
-	cmd[1] = 0x00;
-	cmd[2] = 0x00;
-	cmd[3] = 0x00;
-	ecp5_spi_xfer(dev, cmd, 4, NULL, 0);
-	msleep(200);
+	{
+		u32 id = ecp5_read_idcode(dev);
+		if (id == 0xFFFFFFFF) {
+			printk(KERN_INFO "%s: ECP5 SPI unresponsive, sending REFRESH\n",
+				dev->name);
+			cmd[0] = ECP5_LSC_REFRESH;
+			cmd[1] = 0x00;
+			cmd[2] = 0x00;
+			cmd[3] = 0x00;
+			ecp5_spi_xfer(dev, cmd, 4, NULL, 0);
+			msleep(200);
+			ecp5_spi_reset(dev);
+		}
+	}
 
-	ecp5_read_status(dev, &status);
-	printk(KERN_INFO "%s: ECP5 status after REFRESH: %08x\n", dev->name, status);
-
-	/* 1. ISC_ENABLE */
+	/* 1. ISC_ENABLE — operand 0x00 for normal SRAM programming.
+	 * Note: 0x08 is "transparent" mode (MachXO2), NOT correct for ECP5.
+	 */
 	cmd[0] = ECP5_ISC_ENABLE;
-	cmd[1] = 0x08;
+	cmd[1] = 0x00;
 	cmd[2] = 0x00;
 	cmd[3] = 0x00;
 	ecp5_spi_xfer(dev, cmd, 4, NULL, 0);
@@ -284,100 +352,35 @@ static int ecp5_program_bitstream(struct sc0710_dev *dev, const u8 *data, u32 le
 	ecp5_spi_xfer(dev, cmd, 4, NULL, 0);
 	msleep(1);
 
-	/* 4. LSC_BITSTREAM_BURST — stream the bitstream data.
-	 * Send command byte first, then stream data.
-	 * The ECP5 stays in burst mode until CS deasserts.
-	 * We send in chunks to avoid SPI FIFO overflow.
+	/* 4. LSC_BITSTREAM_BURST — command + all data in ONE CS cycle.
+	 * Windows sends everything in a single CS assertion: command (4 bytes)
+	 * + data (356,448 bytes), byte-by-byte with SPISR polling.
 	 */
-	ecp5_spi_reset(dev);
+	ecp5_spi_burst_write(dev, data, len);
 
-	/* Assert CS, send burst command, then stream data, then deassert */
-	sc_write(dev, 0, SPI_SSR, 0xFFFFFFFE); /* Assert CS */
-
-	/* Send burst command byte */
-	sc_write(dev, 0, SPI_DTR, ECP5_LSC_BITSTREAM_BURST);
-	sc_write(dev, 0, SPI_CR, 0x86); /* Start */
-	for (i = 0; i < 1000; i++) {
-		if (sc_read(dev, 0, SPI_SR) & 0x04)
-			break;
-		udelay(10);
-	}
-	sc_write(dev, 0, SPI_CR, 0x186); /* Inhibit */
-	sc_read(dev, 0, SPI_DRR); /* Drain */
-
-	/* Stream bitstream data byte-by-byte.
-	 * Use FIFO depth of 16 bytes — send in batches.
+	/* Match Windows post-burst sequence exactly:
+	 * ISC_DISABLE → NOP → READ_STATUS (no delays between)
 	 */
-	for (offset = 0; offset < len; offset++) {
-		sc_write(dev, 0, SPI_DTR, data[offset]);
-
-		/* Every 16 bytes, flush the FIFO */
-		if ((offset & 0xF) == 0xF || offset == len - 1) {
-			sc_write(dev, 0, SPI_CR, 0x86); /* Start */
-			for (i = 0; i < 10000; i++) {
-				if (sc_read(dev, 0, SPI_SR) & 0x04)
-					break;
-				udelay(1);
-			}
-			sc_write(dev, 0, SPI_CR, 0x186); /* Inhibit */
-			/* Drain RX */
-			while (!(sc_read(dev, 0, SPI_SR) & 0x01))
-				sc_read(dev, 0, SPI_DRR);
-		}
-
-		/* Progress report every 32KB */
-		if ((offset & 0x7FFF) == 0 && offset > 0)
-			printk(KERN_INFO "%s: ECP5 programming %u/%u bytes\n",
-				dev->name, offset, len);
-	}
-
-	/* Deassert CS to end burst */
-	sc_write(dev, 0, SPI_SSR, 0xFFFFFFFF);
-	msleep(1);
-
-	/* Check status before ISC_DISABLE to see if burst completed */
-	ecp5_read_status(dev, &status);
-	printk(KERN_INFO "%s: ECP5 status after burst: %08x (DONE=%d)\n",
-		dev->name, status, (status >> 8) & 1);
-	msleep(10);
-
-	/* 5. ISC_DISABLE (program done) — 4 bytes per ecpprog */
 	cmd[0] = ECP5_ISC_DISABLE;
 	cmd[1] = 0x00;
 	cmd[2] = 0x00;
 	cmd[3] = 0x00;
 	ecp5_spi_xfer(dev, cmd, 4, NULL, 0);
-	msleep(200);
 
-	ret = ecp5_check_busy(dev, 1000);
-	if (ret) {
-		printk(KERN_ERR "%s: ECP5 busy after ISC_DISABLE\n", dev->name);
-		return ret;
-	}
-
-	/* Verify — read status */
-	ecp5_read_status(dev, &status);
-	printk(KERN_INFO "%s: ECP5 status after ISC_DISABLE: %08x\n", dev->name, status);
-
-	/* 6. LSC_REFRESH — force ECP5 to restart with the new configuration.
-	 * Without this, the ECP5 may stay idle after ISC_DISABLE and never
-	 * start the user design (DONE not set, no TX output).
-	 */
-	cmd[0] = ECP5_LSC_REFRESH;
-	cmd[1] = 0x00;
-	cmd[2] = 0x00;
-	cmd[3] = 0x00;
+	/* NOP (0xFF) — Windows sends this between ISC_DISABLE and status read */
+	cmd[0] = 0xFF;
+	cmd[1] = 0xFF;
+	cmd[2] = 0xFF;
+	cmd[3] = 0xFF;
 	ecp5_spi_xfer(dev, cmd, 4, NULL, 0);
-	msleep(500);
 
 	ecp5_read_status(dev, &status);
-	printk(KERN_INFO "%s: ECP5 status after REFRESH: %08x (DONE=%d)\n",
+	printk(KERN_INFO "%s: ECP5 status after programming: %08x (DONE=%d)\n",
 		dev->name, status, (status >> 8) & 1);
 
-	/* Re-read IDCODE */
-	{
-		u32 id = ecp5_read_idcode(dev);
-		printk(KERN_INFO "%s: ECP5 IDCODE after program: %08x\n", dev->name, id);
+	if (!(status & 0x100) && status != 0xFFFFFFFF) {
+		printk(KERN_ERR "%s: ECP5 DONE not set after programming\n", dev->name);
+		return -EIO;
 	}
 
 	return 0;
@@ -387,20 +390,36 @@ static int ecp5_program_bitstream(struct sc0710_dev *dev, const u8 *data, u32 le
 static int sc0710_ecp5_firmware_check(struct sc0710_dev *dev)
 {
 	const struct firmware *fw;
-	u32 idcode, half_size;
+	u32 idcode, half_size, status, usercode;
 	u8 *decoded;
 	int ret, i;
 
-	idcode = ecp5_read_idcode(dev);
-	printk(KERN_INFO "%s: ECP5 IDCODE: %08x\n", dev->name, idcode);
-
-	if (idcode != 0x41112043 && idcode != 0x41113043) {
-		printk(KERN_INFO "%s: ECP5 firmware current, skipping update\n",
-			dev->name);
-		return 0;
+	/* Probe: try JEDEC SPI flash ID (0x9F) to check if SPI is
+	 * connected to a flash chip or the ECP5 SSPI port.
+	 */
+	{
+		u8 jtx[4] = { 0x9F, 0x00, 0x00, 0x00 };
+		u8 jrx[3] = { 0 };
+		ecp5_spi_reset(dev);
+		ecp5_spi_xfer(dev, jtx, 4, jrx, 3);
+		printk(KERN_INFO "%s: SPI JEDEC probe: %02x %02x %02x\n",
+			dev->name, jrx[0], jrx[1], jrx[2]);
 	}
 
-	printk(KERN_INFO "%s: ECP5 firmware OUTDATED — uploading SC0710.FWI.HEX\n",
+	idcode = ecp5_read_idcode(dev);
+	ecp5_read_status(dev, &status);
+	usercode = ecp5_read_usercode(dev);
+	printk(KERN_INFO "%s: ECP5 IDCODE: %08x, status: %08x (DONE=%d), USERCODE: %08x\n",
+		dev->name, idcode, status, (status >> 8) & 1, usercode);
+
+	/* If DONE=1, the ECP5 is already configured (e.g. warm reboot from Windows).
+	 * TODO: restore skip once cold boot programming verified.
+	 */
+	if (status & 0x100)
+		printk(KERN_INFO "%s: ECP5 DONE=1, re-programming for testing\n",
+			dev->name);
+
+	printk(KERN_INFO "%s: Programming ECP5 — uploading SC0710.FWI.HEX\n",
 		dev->name);
 
 	ret = request_firmware(&fw, "sc0710/SC0710.FWI.HEX", &dev->pci->dev);
@@ -421,45 +440,56 @@ static int sc0710_ecp5_firmware_check(struct sc0710_dev *dev)
 	}
 
 	half_size = (fw->size - FWI_HEADER_SIZE) / 2;
-	printk(KERN_INFO "%s: Firmware file: %zu bytes, bitstream: %u bytes\n",
-		dev->name, fw->size, half_size);
 
-	/* Decode second half (XOR 0xA5) — the Lattice bitstream */
-	decoded = vmalloc(half_size);
+	/* FWI format: 16-byte header + two halves with swapped order.
+	 * Full .bit file = (second half XOR 0xA5) + (first half XOR 0x5A).
+	 * Windows sends all 356,448 bytes including text header.
+	 */
+	decoded = vmalloc(half_size * 2);
 	if (!decoded) {
 		release_firmware(fw);
 		return -ENOMEM;
 	}
 
+	/* First part of bitstream: FWI second half XOR 0xA5 */
 	for (i = 0; i < half_size; i++)
 		decoded[i] = fw->data[FWI_HEADER_SIZE + half_size + i] ^ FWI_XOR_SECOND;
 
+	/* Second part of bitstream: FWI first half XOR 0x5A */
+	for (i = 0; i < half_size; i++)
+		decoded[half_size + i] = fw->data[FWI_HEADER_SIZE + i] ^ FWI_XOR_FIRST;
+
 	release_firmware(fw);
 
-	/* Find the ECP5 SPI preamble (BD B3) and skip the text header.
-	 * The .bit file has an ASCII text header before the actual bitstream.
-	 * The ECP5 may not sync correctly if non-FF bytes precede the preamble.
-	 * Start streaming from the FF bytes just before BD B3.
-	 */
-	{
-		u32 bs_start = 0;
-		for (i = 0; i < (int)half_size - 1; i++) {
-			if (decoded[i] == 0xBD && decoded[i + 1] == 0xB3) {
-				bs_start = (i >= 3) ? i - 3 : 0;
-				break;
-			}
-		}
-		printk(KERN_INFO "%s: ECP5 preamble BD B3 at offset %d, streaming from %u (%u bytes)\n",
-			dev->name, i, bs_start, half_size - bs_start);
-		ret = ecp5_program_bitstream(dev, decoded + bs_start, half_size - bs_start);
-	}
+	printk(KERN_INFO "%s: Bitstream: %u bytes, starts: %*ph\n",
+		dev->name, half_size * 2, 16, decoded);
 
+	ret = ecp5_program_bitstream(dev, decoded, half_size * 2);
 	vfree(decoded);
 
 	if (ret == 0) {
-		printk(KERN_INFO "%s: ECP5 firmware update complete\n", dev->name);
-		/* Allow ECP5 to initialize with new firmware */
-		msleep(1000);
+		u32 a8;
+		int tries;
+
+		printk(KERN_INFO "%s: ECP5 firmware upload complete, waiting for pipeline\n",
+			dev->name);
+
+		/* Wait for A8 to become non-zero — indicates the ECP5 design
+		 * is running and the LT6911 TX→FPGA path is active.
+		 * This can take several hundred ms after programming.
+		 */
+		for (tries = 0; tries < 50; tries++) {
+			msleep(100);
+			a8 = sc_read(dev, 0, 0x00A8);
+			if (a8) {
+				printk(KERN_INFO "%s: ECP5 pipeline active, A8=%08x (after %dms)\n",
+					dev->name, a8, (tries + 1) * 100);
+				break;
+			}
+		}
+		if (!a8)
+			printk(KERN_WARNING "%s: ECP5 pipeline not active after 5s (A8=0)\n",
+				dev->name);
 	}
 
 	return ret;
