@@ -95,17 +95,19 @@ static struct snd_pcm_hardware snd_sc0710_hw_capture =
 {
 	.info = SNDRV_PCM_INFO_BLOCK_TRANSFER |
 	    SNDRV_PCM_INFO_MMAP |
-	    SNDRV_PCM_INFO_INTERLEAVED | SNDRV_PCM_INFO_MMAP_VALID,
+	    SNDRV_PCM_INFO_INTERLEAVED |
+	    SNDRV_PCM_INFO_MMAP_VALID |
+	    SNDRV_PCM_INFO_BATCH,
 	.formats          = SNDRV_PCM_FMTBIT_S16_LE,
 	.rates            = SNDRV_PCM_RATE_48000,
 	.rate_min         = 48000,
 	.rate_max         = 48000,
 	.channels_min     = 2,
 	.channels_max     = 2,
-	.buffer_bytes_max = 32768,
+	.buffer_bytes_max = 131072,
 	.period_bytes_min = 4096,
-	.period_bytes_max = 32768,
-	.periods_min      = 1,
+	.period_bytes_max = 65536,
+	.periods_min      = 2,
 	.periods_max      = 1024,
 };
 
